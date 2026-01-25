@@ -1757,6 +1757,7 @@ mod tests {
             model_info: &model_info,
             features: &features,
             web_search_mode: Some(WebSearchMode::Cached),
+            vector_db: VectorDbConfig::default(),
         });
         let (tools, _) = build_specs(&tools_config, None).build();
         assert!(
@@ -1769,6 +1770,7 @@ mod tests {
             model_info: &model_info,
             features: &features,
             web_search_mode: Some(WebSearchMode::Cached),
+            vector_db: VectorDbConfig::default(),
         });
         let (tools, _) = build_specs(&tools_config, None).build();
         assert_contains_tool_names(&tools, &["request_user_input"]);

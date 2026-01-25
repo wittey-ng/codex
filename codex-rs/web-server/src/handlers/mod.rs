@@ -285,6 +285,9 @@ pub async fn stream_events(
                                 turn_id: ev.turn_id.clone(),
                                 item_id: approval_id.clone(),
                                 reason: ev.reason.clone(),
+                                command: Some(ev.command.join(" ")),
+                                cwd: Some(ev.cwd.clone()),
+                                command_actions: None,
                                 proposed_execpolicy_amendment: ev.proposed_execpolicy_amendment.clone().map(std::convert::Into::into),
                             };
 

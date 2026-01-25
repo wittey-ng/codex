@@ -64,6 +64,7 @@ pub async fn read_config(
     // TODO: Enable axum "query" feature and use Query extractor
     let params = ConfigReadParams {
         include_layers: false,
+        cwd: None,
     };
 
     let response = state.config_service.read(params).await?;

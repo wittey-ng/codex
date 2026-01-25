@@ -65,7 +65,7 @@ pub async fn upload_feedback(
             .get_thread(tid)
             .await
             .ok()
-            .map(|thread| thread.rollout_path());
+            .and_then(|thread| thread.rollout_path());
 
         (tid_str.clone(), path)
     } else {

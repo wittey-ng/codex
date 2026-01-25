@@ -362,7 +362,11 @@ pub const FEATURES: &[FeatureSpec] = &[
     FeatureSpec {
         id: Feature::ResearchMode,
         key: "research_mode",
-        stage: Stage::Experimental,
+        stage: Stage::Experimental {
+            name: "Research mode",
+            menu_description: "Read-only mode that disables editing tools and enables analysis tools.",
+            announcement: "NEW! Try Research mode for read-only codebase analysis.",
+        },
         default_enabled: false,
     },
     FeatureSpec {

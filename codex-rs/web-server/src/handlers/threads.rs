@@ -251,7 +251,9 @@ pub async fn fork_thread(
         .await
         .map_err(|_| ApiError::ThreadNotFound)?;
 
-    let rollout_path = source_thread.rollout_path();
+    let rollout_path = source_thread
+        .rollout_path()
+        .ok_or_else(|| ApiError::InvalidRequest("Source thread has no rollout path".to_string()))?;
 
     // Load config (TODO: support config overrides from request)
     let config = Config::load_with_cli_overrides(vec![])

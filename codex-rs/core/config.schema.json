@@ -189,6 +189,9 @@
             "remote_models": {
               "type": "boolean"
             },
+            "research_mode": {
+              "type": "boolean"
+            },
             "responses_websockets": {
               "type": "boolean"
             },
@@ -1013,6 +1016,24 @@
         }
       ]
     },
+    "VectorDbConfigToml": {
+      "additionalProperties": false,
+      "properties": {
+        "collection": {
+          "description": "Collection name to search.",
+          "type": "string"
+        },
+        "embedding_model": {
+          "description": "Embedding model to use when generating query vectors.",
+          "type": "string"
+        },
+        "url": {
+          "description": "Base URL for the vector database (e.g., Qdrant).",
+          "type": "string"
+        }
+      },
+      "type": "object"
+    },
     "Verbosity": {
       "description": "Controls output length/detail on GPT-5 models via the Responses API. Serialized with lowercase values to match the OpenAI API.",
       "enum": [
@@ -1173,6 +1194,9 @@
           "type": "boolean"
         },
         "remote_models": {
+          "type": "boolean"
+        },
+        "research_mode": {
           "type": "boolean"
         },
         "responses_websockets": {
@@ -1479,6 +1503,14 @@
         }
       ],
       "description": "Collection of settings that are specific to the TUI."
+    },
+    "vector_db": {
+      "allOf": [
+        {
+          "$ref": "#/definitions/VectorDbConfigToml"
+        }
+      ],
+      "description": "Vector database settings used by analysis tools."
     },
     "web_search": {
       "allOf": [
