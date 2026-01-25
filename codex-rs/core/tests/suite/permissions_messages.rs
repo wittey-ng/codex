@@ -110,6 +110,7 @@ async fn permissions_message_added_on_override_change() -> Result<()> {
             effort: None,
             summary: None,
             collaboration_mode: None,
+            personality: None,
         })
         .await?;
 
@@ -132,7 +133,7 @@ async fn permissions_message_added_on_override_change() -> Result<()> {
     let permissions_2 = permissions_texts(input2);
 
     assert_eq!(permissions_1.len(), 1);
-    assert_eq!(permissions_2.len(), 2);
+    assert_eq!(permissions_2.len(), 3);
     let unique = permissions_2.into_iter().collect::<HashSet<String>>();
     assert_eq!(unique.len(), 2);
 
@@ -201,7 +202,11 @@ async fn resume_replays_permissions_messages() -> Result<()> {
         config.approval_policy = Constrained::allow_any(AskForApproval::OnRequest);
     });
     let initial = builder.build(&server).await?;
-    let rollout_path = initial.session_configured.rollout_path.clone();
+    let rollout_path = initial
+        .session_configured
+        .rollout_path
+        .clone()
+        .expect("rollout path");
     let home = initial.home.clone();
 
     initial
@@ -226,6 +231,7 @@ async fn resume_replays_permissions_messages() -> Result<()> {
             effort: None,
             summary: None,
             collaboration_mode: None,
+            personality: None,
         })
         .await?;
 
@@ -257,7 +263,7 @@ async fn resume_replays_permissions_messages() -> Result<()> {
     let body3 = req3.single_request().body_json();
     let input = body3["input"].as_array().expect("input array");
     let permissions = permissions_texts(input);
-    assert_eq!(permissions.len(), 3);
+    assert_eq!(permissions.len(), 4);
     let unique = permissions.into_iter().collect::<HashSet<String>>();
     assert_eq!(unique.len(), 2);
 
@@ -278,7 +284,11 @@ async fn resume_and_fork_append_permissions_messages() -> Result<()> {
         config.approval_policy = Constrained::allow_any(AskForApproval::OnRequest);
     });
     let initial = builder.build(&server).await?;
-    let rollout_path = initial.session_configured.rollout_path.clone();
+    let rollout_path = initial
+        .session_configured
+        .rollout_path
+        .clone()
+        .expect("rollout path");
     let home = initial.home.clone();
 
     initial
@@ -303,6 +313,7 @@ async fn resume_and_fork_append_permissions_messages() -> Result<()> {
             effort: None,
             summary: None,
             collaboration_mode: None,
+            personality: None,
         })
         .await?;
 
@@ -321,7 +332,7 @@ async fn resume_and_fork_append_permissions_messages() -> Result<()> {
     let body2 = req2.single_request().body_json();
     let input2 = body2["input"].as_array().expect("input array");
     let permissions_base = permissions_texts(input2);
-    assert_eq!(permissions_base.len(), 2);
+    assert_eq!(permissions_base.len(), 3);
 
     builder = builder.with_config(|config| {
         config.approval_policy = Constrained::allow_any(AskForApproval::UnlessTrusted);
