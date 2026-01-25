@@ -140,8 +140,11 @@ impl ExecTool {
 
         let result = escalate_server
             .exec(params, cancel_token, &sandbox_state)
-            .await
-            .map_err(|e| McpError::internal_error(e.to_string(), None))?;
+            .await;
+        if let Err(err) = &result {
+            tracing::error!("shell exec failed: {err}");
+        }
+        let result = result.map_err(|e| McpError::internal_error(e.to_string(), None))?;
         Ok(CallToolResult::success(vec![Content::json(
             ExecResult::from(result),
         )?]))

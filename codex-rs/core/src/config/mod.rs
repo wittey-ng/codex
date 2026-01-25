@@ -293,6 +293,9 @@ pub struct Config {
     /// Token budget applied when storing tool/function outputs in the context manager.
     pub tool_output_token_limit: Option<usize>,
 
+    /// Vector database settings used by analysis tools.
+    pub vector_db: VectorDbConfig,
+
     /// Directory containing all Codex state (defaults to `~/.codex` but can be
     /// overridden by the `CODEX_HOME` environment variable).
     pub codex_home: PathBuf,
@@ -912,6 +915,9 @@ pub struct ConfigToml {
     /// Nested tools section for feature toggles
     pub tools: Option<ToolsToml>,
 
+    /// Vector database settings used by analysis tools.
+    pub vector_db: Option<VectorDbConfigToml>,
+
     /// User-level skill config entries keyed by SKILL.md path.
     pub skills: Option<SkillsConfig>,
 
@@ -1017,6 +1023,50 @@ pub struct ToolsToml {
     /// Enable the `view_image` tool that lets the agent attach local images.
     #[serde(default)]
     pub view_image: Option<bool>,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq, JsonSchema)]
+#[schemars(deny_unknown_fields)]
+pub struct VectorDbConfigToml {
+    /// Base URL for the vector database (e.g., Qdrant).
+    pub url: Option<String>,
+    /// Collection name to search.
+    pub collection: Option<String>,
+    /// Embedding model to use when generating query vectors.
+    pub embedding_model: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct VectorDbConfig {
+    pub url: String,
+    pub collection: String,
+    pub embedding_model: String,
+}
+
+impl Default for VectorDbConfig {
+    fn default() -> Self {
+        Self {
+            url: "http://localhost:6333".to_string(),
+            collection: "ecommerce_insights".to_string(),
+            embedding_model: "text-embedding-3-small".to_string(),
+        }
+    }
+}
+
+impl From<VectorDbConfigToml> for VectorDbConfig {
+    fn from(config: VectorDbConfigToml) -> Self {
+        let mut resolved = Self::default();
+        if let Some(url) = config.url {
+            resolved.url = url;
+        }
+        if let Some(collection) = config.collection {
+            resolved.collection = collection;
+        }
+        if let Some(embedding_model) = config.embedding_model {
+            resolved.embedding_model = embedding_model;
+        }
+        resolved
+    }
 }
 
 impl From<ToolsToml> for Tools {
@@ -1166,6 +1216,8 @@ pub struct ConfigOverrides {
     pub tools_web_search_request: Option<bool>,
     /// Additional directories that should be treated as writable roots for this session.
     pub additional_writable_roots: Vec<PathBuf>,
+    /// Agent role override for this session.
+    pub agent_role: Option<crate::agent::role::AgentRole>,
 }
 
 /// Resolves the OSS provider from CLI override, profile config, or global config.
@@ -1252,6 +1304,7 @@ impl Config {
             show_raw_agent_reasoning,
             tools_web_search_request: override_tools_web_search_request,
             additional_writable_roots,
+            agent_role,
         } = overrides;
 
         let active_profile_name = config_profile_key
@@ -1511,6 +1564,9 @@ impl Config {
                 })
                 .collect(),
             tool_output_token_limit: cfg.tool_output_token_limit,
+            vector_db: cfg
+                .vector_db
+                .map_or_else(VectorDbConfig::default, VectorDbConfig::from),
             codex_home,
             config_layer_stack,
             history,
@@ -1608,6 +1664,14 @@ impl Config {
                 }
             },
         };
+
+        // Apply agent role override if specified
+        let mut config = config;
+        if let Some(role) = agent_role {
+            role.apply_to_config(&mut config)
+                .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+        }
+
         Ok(config)
     }
 
@@ -3605,6 +3669,7 @@ model_verbosity = "high"
                 project_doc_max_bytes: PROJECT_DOC_MAX_BYTES,
                 project_doc_fallback_filenames: Vec::new(),
                 tool_output_token_limit: None,
+                vector_db: VectorDbConfig::default(),
                 codex_home: fixture.codex_home(),
                 config_layer_stack: Default::default(),
                 history: History::default(),
@@ -3692,6 +3757,7 @@ model_verbosity = "high"
             project_doc_max_bytes: PROJECT_DOC_MAX_BYTES,
             project_doc_fallback_filenames: Vec::new(),
             tool_output_token_limit: None,
+            vector_db: VectorDbConfig::default(),
             codex_home: fixture.codex_home(),
             config_layer_stack: Default::default(),
             history: History::default(),
@@ -3794,6 +3860,7 @@ model_verbosity = "high"
             project_doc_max_bytes: PROJECT_DOC_MAX_BYTES,
             project_doc_fallback_filenames: Vec::new(),
             tool_output_token_limit: None,
+            vector_db: VectorDbConfig::default(),
             codex_home: fixture.codex_home(),
             config_layer_stack: Default::default(),
             history: History::default(),
@@ -3882,6 +3949,7 @@ model_verbosity = "high"
             project_doc_max_bytes: PROJECT_DOC_MAX_BYTES,
             project_doc_fallback_filenames: Vec::new(),
             tool_output_token_limit: None,
+            vector_db: VectorDbConfig::default(),
             codex_home: fixture.codex_home(),
             config_layer_stack: Default::default(),
             history: History::default(),

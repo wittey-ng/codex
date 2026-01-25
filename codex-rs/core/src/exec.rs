@@ -6,6 +6,8 @@ use std::io;
 use std::path::Path;
 use std::path::PathBuf;
 use std::process::ExitStatus;
+#[cfg(feature = "sandbox-tool")]
+use std::sync::OnceLock;
 use std::time::Duration;
 use std::time::Instant;
 
@@ -119,6 +121,11 @@ pub enum SandboxType {
 
     /// Only available on Windows.
     WindowsRestrictedToken,
+
+    /// Hardware-level isolation using BoxLite micro-VMs.
+    /// Available when sandbox-tool feature is enabled.
+    #[cfg(feature = "sandbox-tool")]
+    BoxLite,
 }
 
 #[derive(Clone)]
@@ -533,6 +540,13 @@ async fn exec(
     {
         return exec_windows_sandbox(params, sandbox_policy).await;
     }
+
+    // Route BoxLite sandbox execution to BoxLite-specific handler
+    #[cfg(feature = "sandbox-tool")]
+    if sandbox == SandboxType::BoxLite {
+        return exec_boxlite(params, sandbox_policy, stdout_stream).await;
+    }
+
     let ExecParams {
         command,
         cwd,
@@ -741,6 +755,274 @@ async fn read_capped<R: AsyncRead + Unpin + Send + 'static>(
 fn synthetic_exit_status(code: i32) -> ExitStatus {
     use std::os::unix::process::ExitStatusExt;
     std::process::ExitStatus::from_raw(code)
+}
+
+#[cfg(feature = "sandbox-tool")]
+async fn exec_boxlite(
+    params: ExecParams,
+    _sandbox_policy: &SandboxPolicy,
+    _stdout_stream: Option<StdoutStream>,
+) -> Result<RawExecToolCallOutput> {
+    use boxlite::BoxCommand;
+    use boxlite::BoxOptions;
+    use boxlite::BoxliteRuntime;
+    use boxlite::RootfsSpec;
+    use futures::StreamExt;
+
+    ensure_boxlite_runtime_dir();
+
+    let ExecParams {
+        command,
+        cwd,
+        expiration,
+        ..
+    } = params;
+
+    tracing::info!("Executing command in BoxLite sandbox: {:?}", command);
+
+    // Create BoxLite runtime
+    let runtime = BoxliteRuntime::default_runtime();
+
+    // Select image based on command
+    let image = select_boxlite_image(&command);
+    tracing::debug!("Selected BoxLite image: {}", image);
+
+    // Configure box options
+    let options = BoxOptions {
+        rootfs: RootfsSpec::Image(image),
+        memory_mib: Some(512),
+        ..Default::default()
+    };
+
+    // Create the box (micro-VM)
+    let litebox = runtime.create(options, None).await.map_err(|e| {
+        CodexErr::Io(io::Error::other(format!(
+            "Failed to create BoxLite VM: {e}"
+        )))
+    })?;
+
+    // Build command (BoxCommand doesn't support current_dir, will use image's default)
+    let (program, args_vec) = command.split_first().ok_or_else(|| {
+        CodexErr::Io(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "command args are empty",
+        ))
+    })?;
+
+    // If cwd is specified and different from root, prepend 'cd' command
+    let box_command = if cwd.as_os_str() != "/" && cwd.as_os_str() != "" {
+        let cd_and_exec = format!("cd {} && {} {}", cwd.display(), program, args_vec.join(" "));
+        let mut cmd = BoxCommand::new("sh");
+        cmd = cmd.arg("-c");
+        cmd = cmd.arg(cd_and_exec);
+        cmd
+    } else {
+        let mut cmd = BoxCommand::new(program);
+        for arg in args_vec {
+            cmd = cmd.arg(arg);
+        }
+        cmd
+    };
+
+    // Execute with timeout
+    let exec_future = async {
+        let mut execution = litebox
+            .exec(box_command)
+            .await
+            .map_err(|e| CodexErr::Io(io::Error::other(format!("BoxLite exec failed: {e}"))))?;
+
+        // Collect stdout
+        let mut stdout_content = Vec::new();
+        if let Some(mut stdout) = execution.stdout() {
+            while let Some(line) = stdout.next().await {
+                stdout_content.extend_from_slice(line.as_bytes());
+                stdout_content.push(b'\n');
+            }
+        }
+
+        // Collect stderr
+        let mut stderr_content = Vec::new();
+        if let Some(mut stderr) = execution.stderr() {
+            while let Some(line) = stderr.next().await {
+                stderr_content.extend_from_slice(line.as_bytes());
+                stderr_content.push(b'\n');
+            }
+        }
+
+        // Wait for exit code
+        let result = execution
+            .wait()
+            .await
+            .map_err(|e| CodexErr::Io(io::Error::other(format!("BoxLite wait failed: {e}"))))?;
+        let exit_code = result.code();
+
+        Ok::<_, CodexErr>((stdout_content, stderr_content, exit_code))
+    };
+
+    // Apply timeout or cancellation
+    let result_with_timeout = match &expiration {
+        ExecExpiration::Timeout(timeout_duration) => {
+            match tokio::time::timeout(*timeout_duration, exec_future).await {
+                Ok(result) => result.map(Some),
+                Err(_) => Ok(None), // Timeout occurred
+            }
+        }
+        ExecExpiration::DefaultTimeout => {
+            let timeout_duration = Duration::from_millis(DEFAULT_EXEC_COMMAND_TIMEOUT_MS);
+            match tokio::time::timeout(timeout_duration, exec_future).await {
+                Ok(result) => result.map(Some),
+                Err(_) => Ok(None), // Timeout occurred
+            }
+        }
+        ExecExpiration::Cancellation(cancel_token) => {
+            tokio::select! {
+                result = exec_future => result.map(Some),
+                _ = cancel_token.cancelled() => Ok(None), // Cancelled
+            }
+        }
+    };
+
+    match result_with_timeout? {
+        Some((stdout_content, stderr_content, exit_code)) => {
+            // Create aggregated output
+            let mut aggregated = stdout_content.clone();
+            aggregated.extend_from_slice(&stderr_content);
+
+            Ok(RawExecToolCallOutput {
+                exit_status: synthetic_exit_status(exit_code),
+                stdout: StreamOutput {
+                    text: stdout_content,
+                    truncated_after_lines: None,
+                },
+                stderr: StreamOutput {
+                    text: stderr_content,
+                    truncated_after_lines: None,
+                },
+                aggregated_output: StreamOutput {
+                    text: aggregated,
+                    truncated_after_lines: None,
+                },
+                timed_out: false,
+            })
+        }
+        None => {
+            // Timeout or cancellation occurred
+            let error_msg = b"Execution timed out or was cancelled".to_vec();
+            Ok(RawExecToolCallOutput {
+                exit_status: synthetic_exit_status(EXEC_TIMEOUT_EXIT_CODE),
+                stdout: StreamOutput {
+                    text: Vec::new(),
+                    truncated_after_lines: None,
+                },
+                stderr: StreamOutput {
+                    text: error_msg.clone(),
+                    truncated_after_lines: None,
+                },
+                aggregated_output: StreamOutput {
+                    text: error_msg,
+                    truncated_after_lines: None,
+                },
+                timed_out: true,
+            })
+        }
+    }
+}
+
+#[cfg(feature = "sandbox-tool")]
+fn ensure_boxlite_runtime_dir() {
+    static INIT: OnceLock<()> = OnceLock::new();
+    INIT.get_or_init(|| {
+        if std::env::var_os("BOXLITE_RUNTIME_DIR").is_some() {
+            return;
+        }
+        if let (Some(source_dir), Some(target_dir)) =
+            (discover_boxlite_runtime_dir(), target_boxlite_runtime_dir())
+            && let Err(err) = sync_boxlite_runtime(&source_dir, &target_dir)
+        {
+            tracing::warn!(
+                "Failed to stage BoxLite runtime from {} to {}: {err}",
+                source_dir.display(),
+                target_dir.display()
+            );
+        }
+    });
+}
+
+#[cfg(feature = "sandbox-tool")]
+fn discover_boxlite_runtime_dir() -> Option<PathBuf> {
+    if !cfg!(debug_assertions) {
+        return None;
+    }
+    let exe = std::env::current_exe().ok()?;
+    let profile_dir = exe.parent()?.parent()?;
+    let build_dir = profile_dir.join("build");
+    let entries = std::fs::read_dir(&build_dir).ok()?;
+    for entry in entries.flatten() {
+        let file_name = entry.file_name();
+        let name = file_name.to_string_lossy();
+        if !name.starts_with("boxlite-") {
+            continue;
+        }
+        let runtime_dir = entry.path().join("out").join("runtime");
+        if runtime_dir.join("mke2fs").is_file() {
+            return Some(runtime_dir);
+        }
+    }
+    None
+}
+
+#[cfg(feature = "sandbox-tool")]
+fn target_boxlite_runtime_dir() -> Option<PathBuf> {
+    let exe = std::env::current_exe().ok()?;
+    let profile_dir = exe.parent()?.parent()?;
+    Some(profile_dir.join("deps").join("runtime"))
+}
+
+#[cfg(feature = "sandbox-tool")]
+fn sync_boxlite_runtime(source_dir: &Path, target_dir: &Path) -> io::Result<()> {
+    std::fs::create_dir_all(target_dir)?;
+    for entry in std::fs::read_dir(source_dir)? {
+        let entry = entry?;
+        if !entry.file_type()?.is_file() {
+            continue;
+        }
+        let file_name = entry.file_name();
+        let source_path = entry.path();
+        let target_path = target_dir.join(&file_name);
+        if target_path.exists() {
+            continue;
+        }
+        std::fs::copy(&source_path, &target_path)?;
+        #[cfg(unix)]
+        {
+            let perms = std::fs::metadata(&source_path)?.permissions();
+            std::fs::set_permissions(&target_path, perms)?;
+        }
+    }
+    Ok(())
+}
+
+#[cfg(feature = "sandbox-tool")]
+fn select_boxlite_image(command: &[String]) -> String {
+    // Simple heuristic to select image based on program name
+    if command.is_empty() {
+        return "alpine:latest".to_string();
+    }
+
+    let program = command[0].to_lowercase();
+
+    if program.contains("python") || program == "python3" || program == "python2" {
+        "python:3.11-slim".to_string()
+    } else if program.contains("node") || program == "npm" || program == "npx" {
+        "node:20-alpine".to_string()
+    } else if program.contains("cargo") || program.contains("rustc") {
+        "rust:1.92-alpine".to_string()
+    } else if program == "sh" || program == "bash" || program.contains("shell") {
+        "alpine:latest".to_string()
+    } else {
+        // Default to alpine for unknown commands
+        "alpine:latest".to_string()
+    }
 }
 
 #[cfg(windows)]

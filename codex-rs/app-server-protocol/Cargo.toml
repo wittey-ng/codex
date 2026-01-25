@@ -23,6 +23,7 @@ serde_json = { workspace = true }
 strum_macros = { workspace = true }
 thiserror = { workspace = true }
 ts-rs = { workspace = true }
+utoipa = "5"
 uuid = { workspace = true, features = ["serde", "v7"] }
 
 [dev-dependencies]

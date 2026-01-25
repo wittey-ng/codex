@@ -3,14 +3,35 @@ use codex_arg0::arg0_dispatch;
 use ctor::ctor;
 use tempfile::TempDir;
 
+struct TestTempDirs {
+    _codex_home: TempDir,
+    _aliases: TempDir,
+}
+
 // This code runs before any other tests are run.
 // It allows the test binary to behave like codex and dispatch to apply_patch and codex-linux-sandbox
 // based on the arg0.
 // NOTE: this doesn't work on ARM
 #[ctor]
-pub static CODEX_ALIASES_TEMP_DIR: TempDir = unsafe {
-    #[allow(clippy::unwrap_used)]
-    arg0_dispatch().unwrap()
+pub static CODEX_TEST_TEMP_DIRS: TestTempDirs = unsafe {
+    let codex_home = match tempfile::Builder::new().prefix("codex-home").tempdir() {
+        Ok(dir) => dir,
+        Err(err) => panic!("failed to create temp CODEX_HOME for tests: {err}"),
+    };
+    // Safety: set before any tests spawn threads, matching arg0_dispatch expectations.
+    unsafe {
+        std::env::set_var("CODEX_HOME", codex_home.path());
+    }
+
+    let aliases = match arg0_dispatch() {
+        Some(aliases) => aliases,
+        None => panic!("expected arg0 dispatch to create PATH aliases for tests"),
+    };
+
+    TestTempDirs {
+        _codex_home: codex_home,
+        _aliases: aliases,
+    }
 };
 
 #[cfg(not(target_os = "windows"))]
@@ -20,6 +41,8 @@ mod apply_patch_cli;
 #[cfg(not(target_os = "windows"))]
 mod approvals;
 mod auth_refresh;
+#[cfg(feature = "sandbox-tool")]
+mod boxlite;
 mod cli_stream;
 mod client;
 mod client_websockets;

@@ -123,6 +123,14 @@ pub fn assess_patch_safety(
 }
 
 pub fn get_platform_sandbox() -> Option<SandboxType> {
+    // When sandbox-tool is enabled, use BoxLite only when explicitly configured.
+    #[cfg(feature = "sandbox-tool")]
+    {
+        if boxlite_enabled() {
+            return Some(SandboxType::BoxLite);
+        }
+    }
+
     if cfg!(target_os = "macos") {
         Some(SandboxType::MacosSeatbelt)
     } else if cfg!(target_os = "linux") {
@@ -138,6 +146,23 @@ pub fn get_platform_sandbox() -> Option<SandboxType> {
     } else {
         None
     }
+}
+
+#[cfg(feature = "sandbox-tool")]
+fn boxlite_enabled() -> bool {
+    fn parse_bool(value: &str) -> bool {
+        value == "1" || value.eq_ignore_ascii_case("true")
+    }
+
+    if std::env::var("CODEX_BOXLITE_TESTS").is_ok_and(|value| parse_bool(&value)) {
+        return true;
+    }
+
+    if std::env::var("CODEX_BOXLITE").is_ok_and(|value| parse_bool(&value)) {
+        return true;
+    }
+
+    std::env::var_os("BOXLITE_RUNTIME_DIR").is_some()
 }
 
 fn is_write_patch_constrained_to_writable_paths(

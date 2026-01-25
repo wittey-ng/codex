@@ -5,7 +5,10 @@
 //! `codex --codex-run-as-apply-patch`, and runs under the current
 //! `SandboxAttempt` with a minimal environment.
 use crate::CODEX_APPLY_PATCH_ARG1;
+use crate::config::types::ShellEnvironmentPolicy;
+use crate::config::types::ShellEnvironmentPolicyInherit;
 use crate::exec::ExecToolCallOutput;
+use crate::exec_env;
 use crate::sandboxing::CommandSpec;
 use crate::sandboxing::SandboxPermissions;
 use crate::sandboxing::execute_env;
@@ -26,7 +29,22 @@ use codex_protocol::protocol::ReviewDecision;
 use codex_utils_absolute_path::AbsolutePathBuf;
 use futures::future::BoxFuture;
 use std::collections::HashMap;
+use std::ffi::OsStr;
+use std::path::Path;
 use std::path::PathBuf;
+
+const LOADER_ENV_VARS: [&str; 4] = [
+    "DYLD_LIBRARY_PATH",
+    "DYLD_FALLBACK_LIBRARY_PATH",
+    "DYLD_INSERT_LIBRARIES",
+    "LD_LIBRARY_PATH",
+];
+const LOADER_PATH_ENV_VARS: [&str; 3] = [
+    "DYLD_LIBRARY_PATH",
+    "DYLD_FALLBACK_LIBRARY_PATH",
+    "LD_LIBRARY_PATH",
+];
+const BOXLITE_RUNTIME_ENV_VAR: &str = "BOXLITE_RUNTIME_DIR";
 
 #[derive(Debug)]
 pub struct ApplyPatchRequest {
@@ -46,10 +64,102 @@ impl ApplyPatchRuntime {
         Self
     }
 
+    fn minimal_env() -> HashMap<String, String> {
+        let policy = ShellEnvironmentPolicy {
+            inherit: ShellEnvironmentPolicyInherit::Core,
+            ..ShellEnvironmentPolicy::default()
+        };
+        let mut env = exec_env::create_env(&policy);
+        for key in LOADER_ENV_VARS {
+            if let Ok(value) = std::env::var(key) {
+                env.insert(key.to_string(), value);
+            }
+        }
+        Self::apply_boxlite_runtime_env(&mut env);
+        env
+    }
+
+    fn apply_boxlite_runtime_env(env: &mut HashMap<String, String>) {
+        let runtime_dir = match Self::boxlite_runtime_dir() {
+            Some(runtime_dir) => runtime_dir,
+            None => return,
+        };
+        let runtime_str = runtime_dir.to_string_lossy().to_string();
+        env.insert(BOXLITE_RUNTIME_ENV_VAR.to_string(), runtime_str);
+        for key in LOADER_PATH_ENV_VARS {
+            Self::prepend_env_path(env, key, &runtime_dir);
+        }
+    }
+
+    fn boxlite_runtime_dir() -> Option<PathBuf> {
+        if let Some(runtime_dir) = std::env::var_os(BOXLITE_RUNTIME_ENV_VAR) {
+            return Some(PathBuf::from(runtime_dir));
+        }
+        let exe = std::env::current_exe().ok()?;
+        let profile_dir = Self::profile_dir_from_exe(&exe)?;
+        let deps_runtime_dir = profile_dir.join("deps").join("runtime");
+        if deps_runtime_dir.join("mke2fs").is_file() {
+            return Some(deps_runtime_dir);
+        }
+        let build_runtime_dir = Self::discover_boxlite_runtime_dir(&profile_dir);
+        if let Some(runtime_dir) = build_runtime_dir {
+            return Some(runtime_dir);
+        }
+        None
+    }
+
+    fn profile_dir_from_exe(exe: &Path) -> Option<PathBuf> {
+        let parent = exe.parent()?;
+        let profile_dir = if parent.file_name() == Some(OsStr::new("deps")) {
+            parent.parent()?
+        } else {
+            parent
+        };
+        Some(profile_dir.to_path_buf())
+    }
+
+    fn discover_boxlite_runtime_dir(profile_dir: &Path) -> Option<PathBuf> {
+        let build_dir = profile_dir.join("build");
+        let entries = std::fs::read_dir(&build_dir).ok()?;
+        for entry in entries.flatten() {
+            let file_name = entry.file_name();
+            let name = file_name.to_string_lossy();
+            if !name.starts_with("boxlite-") {
+                continue;
+            }
+            let runtime_dir = entry.path().join("out").join("runtime");
+            if runtime_dir.join("mke2fs").is_file() {
+                return Some(runtime_dir);
+            }
+        }
+        None
+    }
+
+    fn prepend_env_path(env: &mut HashMap<String, String>, key: &str, value: &Path) {
+        let mut paths = vec![value.to_path_buf()];
+        if let Some(existing) = env.get(key) {
+            let existing_paths = std::env::split_paths(existing);
+            for path in existing_paths {
+                if path != *value {
+                    paths.push(path);
+                }
+            }
+        }
+        if let Ok(joined) = std::env::join_paths(paths) {
+            env.insert(key.to_string(), joined.to_string_lossy().to_string());
+        }
+    }
+
     fn build_command_spec(req: &ApplyPatchRequest) -> Result<CommandSpec, ToolError> {
         use std::env;
-        let exe = if let Some(path) = &req.codex_exe {
-            path.clone()
+        let exe = if cfg!(target_os = "linux") {
+            if let Some(path) = req.codex_exe.as_ref().filter(|path| path.exists()) {
+                path.clone()
+            } else {
+                env::current_exe().map_err(|e| {
+                    ToolError::Rejected(format!("failed to determine codex exe: {e}"))
+                })?
+            }
         } else {
             env::current_exe()
                 .map_err(|e| ToolError::Rejected(format!("failed to determine codex exe: {e}")))?
@@ -60,8 +170,8 @@ impl ApplyPatchRuntime {
             args: vec![CODEX_APPLY_PATCH_ARG1.to_string(), req.action.patch.clone()],
             cwd: req.action.cwd.clone(),
             expiration: req.timeout_ms.into(),
-            // Run apply_patch with a minimal environment for determinism and to avoid leaks.
-            env: HashMap::new(),
+            // Keep env minimal but preserve loader vars needed to run the current binary.
+            env: Self::minimal_env(),
             sandbox_permissions: SandboxPermissions::UseDefault,
             justification: None,
         })

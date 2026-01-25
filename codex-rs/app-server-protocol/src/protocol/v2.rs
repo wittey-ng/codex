@@ -45,6 +45,7 @@ use serde::Serialize;
 use serde_json::Value as JsonValue;
 use thiserror::Error;
 use ts_rs::TS;
+use utoipa::ToSchema;
 
 // Macro to declare a camelCased API v2 enum mirroring a core enum which
 // tends to use either snake_case or kebab-case.
@@ -395,7 +396,7 @@ pub struct ConfigLayer {
     pub config: JsonValue,
 }
 
-#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, JsonSchema, TS)]
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, JsonSchema, TS, ToSchema)]
 #[serde(rename_all = "camelCase")]
 #[ts(export_to = "v2/")]
 pub enum MergeStrategy {
@@ -499,7 +500,7 @@ pub struct ConfigBatchWriteParams {
     pub expected_version: Option<String>,
 }
 
-#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema, TS)]
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema, TS, ToSchema)]
 #[serde(rename_all = "camelCase")]
 #[ts(export_to = "v2/")]
 pub struct ConfigEdit {

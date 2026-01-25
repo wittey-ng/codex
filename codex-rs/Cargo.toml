@@ -47,6 +47,7 @@ members = [
     "utils/string",
     "codex-client",
     "codex-api",
+    "web-server",
 ]
 resolver = "2"
 
@@ -216,6 +217,7 @@ tokio-tungstenite = "0.21.0"
 tokio-util = "0.7.18"
 toml = "0.9.5"
 toml_edit = "0.24.0"
+tower-http = { version = "0.6.1", default-features = false }
 tracing = "0.1.43"
 tracing-appender = "0.2.3"
 tracing-subscriber = "0.3.22"

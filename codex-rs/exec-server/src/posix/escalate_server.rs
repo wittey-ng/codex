@@ -1,5 +1,8 @@
 use std::collections::HashMap;
+use std::ffi::OsStr;
 use std::os::fd::AsRawFd;
+use std::os::unix::process::ExitStatusExt;
+use std::path::Path;
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::sync::Arc;
@@ -26,6 +29,13 @@ use crate::posix::mcp::ExecParams;
 use crate::posix::socket::AsyncDatagramSocket;
 use crate::posix::socket::AsyncSocket;
 use codex_core::exec::ExecExpiration;
+
+const BOXLITE_RUNTIME_ENV_VAR: &str = "BOXLITE_RUNTIME_DIR";
+const LOADER_PATH_ENV_VARS: [&str; 3] = [
+    "DYLD_LIBRARY_PATH",
+    "DYLD_FALLBACK_LIBRARY_PATH",
+    "LD_LIBRARY_PATH",
+];
 
 pub(crate) struct EscalateServer {
     bash_path: PathBuf,
@@ -57,6 +67,7 @@ impl EscalateServer {
 
         let escalate_task = tokio::spawn(escalate_task(escalate_server, self.policy.clone()));
         let mut env = std::env::vars().collect::<HashMap<String, String>>();
+        apply_boxlite_runtime_env(&mut env);
         env.insert(
             ESCALATE_SOCKET_ENV_VAR.to_string(),
             client_socket.as_raw_fd().to_string(),
@@ -107,6 +118,79 @@ impl EscalateServer {
     }
 }
 
+fn apply_boxlite_runtime_env(env: &mut HashMap<String, String>) {
+    let runtime_dir = match boxlite_runtime_dir() {
+        Some(runtime_dir) => runtime_dir,
+        None => return,
+    };
+    env.insert(
+        BOXLITE_RUNTIME_ENV_VAR.to_string(),
+        runtime_dir.to_string_lossy().to_string(),
+    );
+    for key in LOADER_PATH_ENV_VARS {
+        prepend_env_path(env, key, &runtime_dir);
+    }
+}
+
+fn boxlite_runtime_dir() -> Option<PathBuf> {
+    if let Some(runtime_dir) = std::env::var_os(BOXLITE_RUNTIME_ENV_VAR) {
+        return Some(PathBuf::from(runtime_dir));
+    }
+    let exe = std::env::current_exe().ok()?;
+    let profile_dir = profile_dir_from_exe(&exe)?;
+    let deps_runtime_dir = profile_dir.join("deps").join("runtime");
+    if deps_runtime_dir.join("mke2fs").is_file() {
+        return Some(deps_runtime_dir);
+    }
+    let build_runtime_dir = discover_boxlite_runtime_dir(&profile_dir);
+    if let Some(runtime_dir) = build_runtime_dir {
+        return Some(runtime_dir);
+    }
+    None
+}
+
+fn profile_dir_from_exe(exe: &Path) -> Option<PathBuf> {
+    let parent = exe.parent()?;
+    let profile_dir = if parent.file_name() == Some(OsStr::new("deps")) {
+        parent.parent()?
+    } else {
+        parent
+    };
+    Some(profile_dir.to_path_buf())
+}
+
+fn discover_boxlite_runtime_dir(profile_dir: &Path) -> Option<PathBuf> {
+    let build_dir = profile_dir.join("build");
+    let entries = std::fs::read_dir(&build_dir).ok()?;
+    for entry in entries.flatten() {
+        let file_name = entry.file_name();
+        let name = file_name.to_string_lossy();
+        if !name.starts_with("boxlite-") {
+            continue;
+        }
+        let runtime_dir = entry.path().join("out").join("runtime");
+        if runtime_dir.join("mke2fs").is_file() {
+            return Some(runtime_dir);
+        }
+    }
+    None
+}
+
+fn prepend_env_path(env: &mut HashMap<String, String>, key: &str, value: &Path) {
+    let mut paths = vec![value.to_path_buf()];
+    if let Some(existing) = env.get(key) {
+        let existing_paths = std::env::split_paths(existing);
+        for path in existing_paths {
+            if path != *value {
+                paths.push(path);
+            }
+        }
+    }
+    if let Ok(joined) = std::env::join_paths(paths) {
+        env.insert(key.to_string(), joined.to_string_lossy().to_string());
+    }
+}
+
 async fn escalate_task(
     socket: AsyncDatagramSocket,
     policy: Arc<dyn EscalationPolicy>,
@@ -147,6 +231,12 @@ async fn handle_escalate_session_with_policy(
     } = socket.receive::<EscalateRequest>().await?;
     let file = PathBuf::from(&file).absolutize()?.into_owned();
     let workdir = PathBuf::from(&workdir).absolutize()?.into_owned();
+    tracing::debug!(
+        file = %file.display(),
+        workdir = %workdir.display(),
+        argv = ?argv,
+        "received exec request"
+    );
     let action = policy
         .determine_action(file.as_path(), &argv, &workdir)
         .await?;
@@ -208,11 +298,13 @@ async fn handle_escalate_session_with_policy(
             }
             let mut child = command.spawn()?;
             let exit_status = child.wait().await?;
-            socket
-                .send(SuperExecResult {
-                    exit_code: exit_status.code().unwrap_or(127),
-                })
-                .await?;
+            let exit_code = exit_status.code().unwrap_or(127);
+            if let Some(signal) = exit_status.signal() {
+                tracing::warn!(signal, exit_code, "escalated command terminated by signal");
+            } else {
+                tracing::debug!(exit_code, "escalated command completed");
+            }
+            socket.send(SuperExecResult { exit_code }).await?;
         }
         EscalateAction::Deny { reason } => {
             socket

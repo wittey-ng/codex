@@ -1,8 +1,10 @@
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 use std::borrow::Cow;
+use std::path::Path;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::Mutex;
+use std::time::Duration;
 
 use anyhow::Context;
 use anyhow::Result;
@@ -95,18 +97,7 @@ prefix_rule(
     // auto-approved.
     let CallToolResult {
         content, is_error, ..
-    } = service
-        .call_tool(CallToolRequestParam {
-            name: Cow::Borrowed("shell"),
-            arguments: Some(object(json!(
-                {
-                    "login": USE_LOGIN_SHELL,
-                    "command": "git init .",
-                    "workdir": project_root_path.to_string_lossy(),
-                }
-            ))),
-        })
-        .await?;
+    } = call_shell_with_retry(&service, &project_root_path, USE_LOGIN_SHELL).await?;
     let tool_call_content = content
         .first()
         .expect("expected non-empty content")
@@ -187,4 +178,55 @@ async fn resolve_git_path(use_login_shell: bool) -> Result<String> {
         .to_string();
     ensure!(!git_path.is_empty(), "git path should not be empty");
     Ok(git_path)
+}
+
+async fn call_shell_with_retry(
+    service: &rmcp::service::RunningService<rmcp::RoleClient, InteractiveClient>,
+    project_root_path: &Path,
+    use_login_shell: bool,
+) -> Result<CallToolResult> {
+    const MAX_ATTEMPTS: usize = 3;
+    const RETRY_DELAY_MS: u64 = 150;
+
+    for attempt in 1..=MAX_ATTEMPTS {
+        let result = service
+            .call_tool(CallToolRequestParam {
+                name: Cow::Borrowed("shell"),
+                arguments: Some(object(json!(
+                    {
+                        "login": use_login_shell,
+                        "command": "git init .",
+                        "workdir": project_root_path.to_string_lossy(),
+                    }
+                ))),
+            })
+            .await;
+        match result {
+            Ok(tool_result) => {
+                if attempt > 1 {
+                    tracing::info!(attempt, "shell call succeeded after retry");
+                }
+                return Ok(tool_result);
+            }
+            Err(err) => {
+                let err_string = err.to_string();
+                let retryable = is_retryable_exec_error(&err_string);
+                tracing::warn!(attempt, retryable, "shell call failed: {err_string}");
+                if attempt == MAX_ATTEMPTS || !retryable {
+                    return Err(anyhow::anyhow!(
+                        "shell call failed after {attempt} attempts: {err_string}"
+                    ));
+                }
+                tokio::time::sleep(Duration::from_millis(RETRY_DELAY_MS * attempt as u64)).await;
+            }
+        }
+    }
+    unreachable!("retry loop should return success or error")
+}
+
+fn is_retryable_exec_error(err: &str) -> bool {
+    let err_lower = err.to_ascii_lowercase();
+    err_lower.contains("sandbox error")
+        || err_lower.contains("killed by a signal")
+        || err_lower.contains("signal")
 }

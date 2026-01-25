@@ -114,6 +114,9 @@
         "remote_models": {
           "type": "boolean"
         },
+        "research_mode": {
+          "type": "boolean"
+        },
         "shell_snapshot": {
           "type": "boolean"
         },
@@ -403,6 +406,14 @@
         }
       ]
     },
+    "vector_db": {
+      "description": "Vector database settings used by analysis tools.",
+      "allOf": [
+        {
+          "$ref": "#/definitions/VectorDbConfigToml"
+        }
+      ]
+    },
     "web_search": {
       "description": "Controls the web search tool mode: disabled, cached, or live.",
       "allOf": [
@@ -588,6 +599,9 @@
               "type": "boolean"
             },
             "remote_models": {
+              "type": "boolean"
+            },
+            "research_mode": {
               "type": "boolean"
             },
             "shell_snapshot": {
@@ -1457,6 +1471,24 @@
           ]
         }
       ]
+    },
+    "VectorDbConfigToml": {
+      "type": "object",
+      "properties": {
+        "collection": {
+          "description": "Collection name to search.",
+          "type": "string"
+        },
+        "embedding_model": {
+          "description": "Embedding model to use when generating query vectors.",
+          "type": "string"
+        },
+        "url": {
+          "description": "Base URL for the vector database (e.g., Qdrant).",
+          "type": "string"
+        }
+      },
+      "additionalProperties": false
     },
     "Verbosity": {
       "description": "Controls output length/detail on GPT-5 models via the Responses API. Serialized with lowercase values to match the OpenAI API.",

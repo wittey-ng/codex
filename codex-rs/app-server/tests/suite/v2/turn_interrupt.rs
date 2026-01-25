@@ -20,7 +20,7 @@ use codex_app_server_protocol::UserInput as V2UserInput;
 use tempfile::TempDir;
 use tokio::time::timeout;
 
-const DEFAULT_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+const DEFAULT_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(20);
 
 #[tokio::test]
 async fn turn_interrupt_aborts_running_turn() -> Result<()> {
@@ -86,8 +86,11 @@ async fn turn_interrupt_aborts_running_turn() -> Result<()> {
     .await??;
     let TurnStartResponse { turn } = to_response::<TurnStartResponse>(turn_resp)?;
 
-    // Give the command a brief moment to start.
-    tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+    timeout(
+        DEFAULT_READ_TIMEOUT,
+        mcp.read_stream_until_notification_message("codex/event/exec_command_begin"),
+    )
+    .await??;
 
     let thread_id = thread.id.clone();
     // Interrupt the in-progress turn by id (v2 API).

@@ -1,4 +1,5 @@
 use anyhow::Result;
+use anyhow::anyhow;
 use codex_core::features::Feature;
 use codex_core::protocol::AskForApproval;
 use codex_core::protocol::EventMsg;
@@ -303,7 +304,17 @@ async fn shell_command_snapshot_still_intercepts_apply_patch() -> Result<()> {
 
     wait_for_event(&codex, |ev| matches!(ev, EventMsg::TurnComplete(_))).await;
 
-    assert_eq!(fs::read_to_string(&target).await?, "hello from snapshot\n");
+    let file_contents = match fs::read_to_string(&target).await {
+        Ok(contents) => contents,
+        Err(err) => {
+            let output = harness.function_call_stdout(call_id).await;
+            return Err(anyhow!(
+                "apply_patch did not create {}: {err}; tool output: {output}",
+                target.display()
+            ));
+        }
+    };
+    assert_eq!(file_contents, "hello from snapshot\n");
 
     let mut entries = fs::read_dir(codex_home.join("shell_snapshots")).await?;
     let snapshot_path = entries

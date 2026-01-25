@@ -150,6 +150,10 @@ impl SandboxManager {
             // When building for non-Windows targets, this variant is never constructed.
             #[cfg(not(target_os = "windows"))]
             SandboxType::WindowsRestrictedToken => (command, HashMap::new(), None),
+            // BoxLite executes commands in micro-VMs. We leave the command unchanged
+            // and handle execution in the BoxLite-specific exec path.
+            #[cfg(feature = "sandbox-tool")]
+            SandboxType::BoxLite => (command, HashMap::new(), None),
         };
 
         env.extend(sandbox_env);

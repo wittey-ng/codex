@@ -69,6 +69,8 @@ pub enum Feature {
     // Experimental
     /// Use the single unified PTY-backed exec tool.
     UnifiedExec,
+    /// Run Codex in read-only research mode (disables editing tools, enables analysis tools).
+    ResearchMode,
     /// Include the freeform apply_patch tool.
     ApplyPatchFreeform,
     /// Allow the model to request web searches that fetch live content.
@@ -346,6 +348,12 @@ pub const FEATURES: &[FeatureSpec] = &[
             menu_description: "Run long-running terminal commands in the background.",
             announcement: "NEW! Try Background terminals for long-running commands. Enable in /experimental!",
         },
+        default_enabled: false,
+    },
+    FeatureSpec {
+        id: Feature::ResearchMode,
+        key: "research_mode",
+        stage: Stage::Experimental,
         default_enabled: false,
     },
     FeatureSpec {

@@ -26,11 +26,13 @@ use core_test_support::test_codex::TestCodex;
 use core_test_support::test_codex::test_codex;
 use core_test_support::wait_for_event;
 use std::sync::Mutex;
+use std::time::Duration;
 use tracing::Level;
 use tracing_test::traced_test;
 
 use tracing_subscriber::fmt::format::FmtSpan;
 use tracing_test::internal::MockWriter;
+use tracing_test::internal::global_buf;
 
 #[tokio::test]
 #[traced_test]
@@ -39,7 +41,8 @@ async fn responses_api_emits_api_request_event() {
 
     mount_sse_once(&server, sse(vec![ev_completed("done")])).await;
 
-    let TestCodex { codex, .. } = test_codex().build(&server).await.unwrap();
+    let test_codex = test_codex().build(&server).await.unwrap();
+    let codex = test_codex.codex.clone();
 
     codex
         .submit(Op::UserInput {
@@ -52,7 +55,7 @@ async fn responses_api_emits_api_request_event() {
         .await
         .unwrap();
 
-    wait_for_event(&codex, |ev| matches!(ev, EventMsg::TurnComplete(_))).await;
+    wait_for_event(&codex, |ev| matches!(ev, EventMsg::TokenCount(_))).await;
 
     logs_assert(|lines: &[&str]| {
         lines
@@ -71,7 +74,7 @@ async fn responses_api_emits_api_request_event() {
     });
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "current_thread")]
 #[traced_test]
 async fn process_sse_emits_tracing_for_output_item() {
     let server = start_mock_server().await;
@@ -82,7 +85,9 @@ async fn process_sse_emits_tracing_for_output_item() {
     )
     .await;
 
-    let TestCodex { codex, .. } = test_codex().build(&server).await.unwrap();
+    let test_codex = test_codex().build(&server).await.unwrap();
+    let session_id = test_codex.session_configured.session_id.to_string();
+    let codex = test_codex.codex.clone();
 
     codex
         .submit(Op::UserInput {
@@ -95,18 +100,18 @@ async fn process_sse_emits_tracing_for_output_item() {
         .await
         .unwrap();
 
-    wait_for_event(&codex, |ev| matches!(ev, EventMsg::TurnComplete(_))).await;
+    wait_for_event(&codex, |ev| matches!(ev, EventMsg::TokenCount(_))).await;
+    tokio::time::sleep(Duration::from_millis(50)).await;
 
-    logs_assert(|lines: &[&str]| {
-        lines
-            .iter()
-            .find(|line| {
-                line.contains("codex.sse_event")
-                    && line.contains("event.kind=response.output_item.done")
-            })
-            .map(|_| Ok(()))
-            .unwrap_or(Err("missing response.output_item.done event".to_string()))
-    });
+    let logs = String::from_utf8(global_buf().lock().unwrap().clone()).unwrap();
+    assert!(
+        logs.lines().any(|line| {
+            line.contains("codex.sse_event")
+                && line.contains("event.kind=response.output_item.done")
+                && line.contains(&format!("conversation.id={session_id}"))
+        }),
+        "missing response.output_item.done event"
+    );
 }
 
 #[tokio::test]
@@ -665,7 +670,7 @@ async fn handle_response_item_records_tool_result_for_custom_tool_call() {
         .await
         .unwrap();
 
-    wait_for_event(&codex, |ev| matches!(ev, EventMsg::TokenCount(_))).await;
+    wait_for_event(&codex, |ev| matches!(ev, EventMsg::TurnComplete(_))).await;
 
     logs_assert(|lines: &[&str]| {
         let line = lines
@@ -734,7 +739,7 @@ async fn handle_response_item_records_tool_result_for_function_call() {
         .await
         .unwrap();
 
-    wait_for_event(&codex, |ev| matches!(ev, EventMsg::TokenCount(_))).await;
+    wait_for_event(&codex, |ev| matches!(ev, EventMsg::TurnComplete(_))).await;
 
     logs_assert(|lines: &[&str]| {
         let line = lines
@@ -794,13 +799,15 @@ async fn handle_response_item_records_tool_result_for_local_shell_missing_ids() 
     )
     .await;
 
-    let TestCodex { codex, .. } = test_codex()
+    let test_codex = test_codex()
         .with_config(move |config| {
             config.features.disable(Feature::GhostCommit);
         })
         .build(&server)
         .await
         .unwrap();
+    let session_id = test_codex.session_configured.session_id.to_string();
+    let codex = test_codex.codex.clone();
 
     codex
         .submit(Op::UserInput {
@@ -814,23 +821,25 @@ async fn handle_response_item_records_tool_result_for_local_shell_missing_ids() 
         .unwrap();
 
     wait_for_event(&codex, |ev| matches!(ev, EventMsg::TokenCount(_))).await;
+    tokio::time::sleep(Duration::from_millis(50)).await;
 
-    logs_assert(|lines: &[&str]| {
-        let line = lines
-            .iter()
-            .find(|line| {
-                line.contains("codex.tool_result")
-                    && line.contains(&"tool_name=local_shell".to_string())
-                    && line.contains("output=LocalShellCall without call_id or id")
-            })
-            .ok_or_else(|| "missing codex.tool_result event".to_string())?;
+    let logs = String::from_utf8(global_buf().lock().unwrap().clone()).unwrap();
+    let expected_output = "LocalShellCall without call_id or id";
+    let line = logs
+        .lines()
+        .find(|line| {
+            let has_output = line.contains(&format!("output={expected_output}"))
+                || line.contains(&format!("output=\"{expected_output}\""));
+            line.contains("codex.tool_result")
+                && line.contains("tool_name=local_shell")
+                && line.contains(&format!("conversation.id={session_id}"))
+                && has_output
+        })
+        .unwrap_or_else(|| {
+            panic!("missing codex.tool_result event\nlogs:\n{logs}");
+        });
 
-        if !line.contains("success=false") {
-            return Err("missing success field".to_string());
-        }
-
-        Ok(())
-    });
+    assert!(line.contains("success=false"), "missing success field");
 }
 
 #[cfg(target_os = "macos")]
@@ -876,7 +885,7 @@ async fn handle_response_item_records_tool_result_for_local_shell_call() {
         .await
         .unwrap();
 
-    wait_for_event(&codex, |ev| matches!(ev, EventMsg::TokenCount(_))).await;
+    wait_for_event(&codex, |ev| matches!(ev, EventMsg::TurnComplete(_))).await;
 
     logs_assert(|lines: &[&str]| {
         let line = lines

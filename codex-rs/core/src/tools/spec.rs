@@ -1,6 +1,7 @@
 use crate::agent::AgentRole;
 use crate::client_common::tools::ResponsesApiTool;
 use crate::client_common::tools::ToolSpec;
+use crate::config::VectorDbConfig;
 use crate::features::Feature;
 use crate::features::Features;
 use crate::tools::handlers::PLAN_TOOL;
@@ -28,12 +29,14 @@ pub(crate) struct ToolsConfig {
     pub web_search_mode: Option<WebSearchMode>,
     pub collab_tools: bool,
     pub experimental_supported_tools: Vec<String>,
+    pub vector_db: VectorDbConfig,
 }
 
 pub(crate) struct ToolsConfigParams<'a> {
     pub(crate) model_info: &'a ModelInfo,
     pub(crate) features: &'a Features,
     pub(crate) web_search_mode: Option<WebSearchMode>,
+    pub(crate) vector_db: VectorDbConfig,
 }
 
 impl ToolsConfig {
@@ -42,9 +45,11 @@ impl ToolsConfig {
             model_info,
             features,
             web_search_mode,
+            vector_db,
         } = params;
         let include_apply_patch_tool = features.enabled(Feature::ApplyPatchFreeform);
         let include_collab_tools = features.enabled(Feature::Collab);
+        let research_mode = features.enabled(Feature::ResearchMode);
 
         let shell_type = if !features.enabled(Feature::ShellTool) {
             ConfigShellToolType::Disabled
@@ -59,24 +64,40 @@ impl ToolsConfig {
             model_info.shell_type
         };
 
-        let apply_patch_tool_type = match model_info.apply_patch_tool_type {
-            Some(ApplyPatchToolType::Freeform) => Some(ApplyPatchToolType::Freeform),
-            Some(ApplyPatchToolType::Function) => Some(ApplyPatchToolType::Function),
-            None => {
-                if include_apply_patch_tool {
-                    Some(ApplyPatchToolType::Freeform)
-                } else {
-                    None
+        // In research mode, disable apply_patch tool
+        let apply_patch_tool_type = if research_mode {
+            None
+        } else {
+            match model_info.apply_patch_tool_type {
+                Some(ApplyPatchToolType::Freeform) => Some(ApplyPatchToolType::Freeform),
+                Some(ApplyPatchToolType::Function) => Some(ApplyPatchToolType::Function),
+                None => {
+                    if include_apply_patch_tool {
+                        Some(ApplyPatchToolType::Freeform)
+                    } else {
+                        None
+                    }
                 }
             }
         };
+
+        // In research mode, enable analysis tools (grep_files, read_file, list_dir)
+        let mut experimental_supported_tools = model_info.experimental_supported_tools.clone();
+        if research_mode {
+            for tool in ["grep_files", "list_dir", "read_file"] {
+                if !experimental_supported_tools.iter().any(|t| t == tool) {
+                    experimental_supported_tools.push(tool.to_string());
+                }
+            }
+        }
 
         Self {
             shell_type,
             apply_patch_tool_type,
             web_search_mode: *web_search_mode,
             collab_tools: include_collab_tools,
-            experimental_supported_tools: model_info.experimental_supported_tools.clone(),
+            experimental_supported_tools,
+            vector_db: vector_db.clone(),
         }
     }
 }
@@ -429,6 +450,147 @@ fn create_view_image_tool() -> ToolSpec {
         parameters: JsonSchema::Object {
             properties,
             required: Some(vec!["path".to_string()]),
+            additional_properties: Some(false.into()),
+        },
+    })
+}
+
+fn create_query_vector_db_tool() -> ToolSpec {
+    let mut properties = BTreeMap::new();
+    properties.insert(
+        "query".to_string(),
+        JsonSchema::String {
+            description: Some("Natural language query to search for in the vector database (e.g., 'iPhone 16 battery complaints', 'positive reviews about camera quality')".to_string()),
+        },
+    );
+    properties.insert(
+        "platform".to_string(),
+        JsonSchema::String {
+            description: Some("Filter by platform: xhs (Xiaohongshu), dy (Douyin), ks (Kuaishou), bili (Bilibili), wb (Weibo)".to_string()),
+        },
+    );
+    properties.insert(
+        "doc_type".to_string(),
+        JsonSchema::String {
+            description: Some(
+                "Filter by document type: customer_demand, pain_point, sentiment, product_mention"
+                    .to_string(),
+            ),
+        },
+    );
+    properties.insert(
+        "limit".to_string(),
+        JsonSchema::Number {
+            description: Some("Maximum number of results to return (default: 10)".to_string()),
+        },
+    );
+    properties.insert(
+        "min_likes".to_string(),
+        JsonSchema::Number {
+            description: Some("Minimum likes/engagement threshold".to_string()),
+        },
+    );
+    properties.insert(
+        "sentiment".to_string(),
+        JsonSchema::String {
+            description: Some("Filter by sentiment: positive, negative, neutral".to_string()),
+        },
+    );
+
+    ToolSpec::Function(ResponsesApiTool {
+        name: "query_vector_db".to_string(),
+        description: "Search the e-commerce insights vector database for customer demands, pain points, sentiment analysis, and product mentions from social media platforms. Use this to analyze market trends, customer feedback, and product perception.".to_string(),
+        strict: false,
+        parameters: JsonSchema::Object {
+            properties,
+            required: Some(vec!["query".to_string()]),
+            additional_properties: Some(false.into()),
+        },
+    })
+}
+
+fn create_generate_image_tool() -> ToolSpec {
+    let mut properties = BTreeMap::new();
+    properties.insert(
+        "prompt".to_string(),
+        JsonSchema::String {
+            description: Some("Detailed description of the image to generate (e.g., 'A professional product photo of iPhone 16 with clean white background, highlighting the improved battery life')".to_string()),
+        },
+    );
+    properties.insert(
+        "size".to_string(),
+        JsonSchema::String {
+            description: Some(
+                "Image size: 1024x1024 (default), 1792x1024, or 1024x1792".to_string(),
+            ),
+        },
+    );
+    properties.insert(
+        "quality".to_string(),
+        JsonSchema::String {
+            description: Some("Image quality: standard (default) or hd".to_string()),
+        },
+    );
+    properties.insert(
+        "n".to_string(),
+        JsonSchema::Number {
+            description: Some("Number of images to generate (1-4, default: 1)".to_string()),
+        },
+    );
+
+    ToolSpec::Function(ResponsesApiTool {
+        name: "generate_image".to_string(),
+        description: "Generate high-quality images using DALL-E 3 for e-commerce marketing, product visualization, or content creation. The generated images are returned as base64-encoded content.".to_string(),
+        strict: false,
+        parameters: JsonSchema::Object {
+            properties,
+            required: Some(vec!["prompt".to_string()]),
+            additional_properties: Some(false.into()),
+        },
+    })
+}
+
+fn create_generate_video_tool() -> ToolSpec {
+    let mut properties = BTreeMap::new();
+    properties.insert(
+        "prompt".to_string(),
+        JsonSchema::String {
+            description: Some("Detailed description of the video to generate (e.g., 'A 5-second product demo showing iPhone 16 rotating on a clean background with smooth lighting')".to_string()),
+        },
+    );
+    properties.insert(
+        "model".to_string(),
+        JsonSchema::String {
+            description: Some(
+                "Video model (default: sora-2; allowed: sora-2, sora-2-pro). Larger resolutions require sora-2-pro.".to_string(),
+            ),
+        },
+    );
+    properties.insert(
+        "duration".to_string(),
+        JsonSchema::Number {
+            description: Some(
+                "Video duration in seconds (default: 4; allowed: 4, 8, 12)".to_string(),
+            ),
+        },
+    );
+    properties.insert(
+        "resolution".to_string(),
+        JsonSchema::String {
+            description: Some(
+                "Video resolution (default: 720x1280; allowed: 720x1280, 1280x720, 1024x1792, 1792x1024; larger sizes require sora-2-pro)"
+                    .to_string(),
+            ),
+        },
+    );
+
+    ToolSpec::Function(ResponsesApiTool {
+        name: "generate_video".to_string(),
+        description: "Generate short-form video content using OpenAI Sora for e-commerce marketing, product demonstrations, or social media content.".to_string(),
+        strict: false,
+        parameters: JsonSchema::Object {
+            properties,
+            required: Some(vec!["prompt".to_string()]),
             additional_properties: Some(false.into()),
         },
     })
@@ -1134,11 +1296,14 @@ pub(crate) fn build_specs(
 ) -> ToolRegistryBuilder {
     use crate::tools::handlers::ApplyPatchHandler;
     use crate::tools::handlers::CollabHandler;
+    use crate::tools::handlers::GenerateImageHandler;
+    use crate::tools::handlers::GenerateVideoHandler;
     use crate::tools::handlers::GrepFilesHandler;
     use crate::tools::handlers::ListDirHandler;
     use crate::tools::handlers::McpHandler;
     use crate::tools::handlers::McpResourceHandler;
     use crate::tools::handlers::PlanHandler;
+    use crate::tools::handlers::QueryVectorDbHandler;
     use crate::tools::handlers::ReadFileHandler;
     use crate::tools::handlers::ShellCommandHandler;
     use crate::tools::handlers::ShellHandler;
@@ -1154,6 +1319,9 @@ pub(crate) fn build_specs(
     let plan_handler = Arc::new(PlanHandler);
     let apply_patch_handler = Arc::new(ApplyPatchHandler);
     let view_image_handler = Arc::new(ViewImageHandler);
+    let query_vector_db_handler = Arc::new(QueryVectorDbHandler::new(config.vector_db.clone()));
+    let generate_image_handler = Arc::new(GenerateImageHandler);
+    let generate_video_handler = Arc::new(GenerateVideoHandler);
     let mcp_handler = Arc::new(McpHandler);
     let mcp_resource_handler = Arc::new(McpResourceHandler);
     let shell_command_handler = Arc::new(ShellCommandHandler);
@@ -1262,6 +1430,13 @@ pub(crate) fn build_specs(
 
     builder.push_spec_with_parallel_support(create_view_image_tool(), true);
     builder.register_handler("view_image", view_image_handler);
+
+    builder.push_spec_with_parallel_support(create_query_vector_db_tool(), true);
+    builder.register_handler("query_vector_db", query_vector_db_handler);
+    builder.push_spec_with_parallel_support(create_generate_image_tool(), true);
+    builder.register_handler("generate_image", generate_image_handler);
+    builder.push_spec_with_parallel_support(create_generate_video_tool(), true);
+    builder.register_handler("generate_video", generate_video_handler);
 
     if config.collab_tools {
         let collab_handler = Arc::new(CollabHandler);
@@ -1402,6 +1577,7 @@ mod tests {
             model_info: &model_info,
             features: &features,
             web_search_mode: Some(WebSearchMode::Live),
+            vector_db: config.vector_db,
         });
         let (tools, _) = build_specs(&config, None).build();
 
@@ -1435,6 +1611,9 @@ mod tests {
                 external_web_access: Some(true),
             },
             create_view_image_tool(),
+            create_query_vector_db_tool(),
+            create_generate_image_tool(),
+            create_generate_video_tool(),
         ] {
             expected.insert(tool_name(&spec).to_string(), spec);
         }
@@ -1464,6 +1643,7 @@ mod tests {
             model_info: &model_info,
             features: &features,
             web_search_mode: Some(WebSearchMode::Cached),
+            vector_db: config.vector_db,
         });
         let (tools, _) = build_specs(&tools_config, None).build();
         assert_contains_tool_names(
@@ -1484,10 +1664,17 @@ mod tests {
             model_info: &model_info,
             features,
             web_search_mode,
+            vector_db: config.vector_db,
         });
         let (tools, _) = build_specs(&tools_config, Some(HashMap::new())).build();
         let tool_names = tools.iter().map(|t| t.spec.name()).collect::<Vec<_>>();
-        assert_eq!(&tool_names, &expected_tools,);
+        let mut expected = expected_tools.to_vec();
+        for tool in ["query_vector_db", "generate_image", "generate_video"] {
+            if !expected.contains(&tool) {
+                expected.push(tool);
+            }
+        }
+        assert_eq!(&tool_names, &expected);
     }
 
     #[test]
@@ -1500,6 +1687,7 @@ mod tests {
             model_info: &model_info,
             features: &features,
             web_search_mode: Some(WebSearchMode::Cached),
+            vector_db: config.vector_db,
         });
         let (tools, _) = build_specs(&tools_config, None).build();
 
@@ -1522,6 +1710,7 @@ mod tests {
             model_info: &model_info,
             features: &features,
             web_search_mode: Some(WebSearchMode::Live),
+            vector_db: config.vector_db,
         });
         let (tools, _) = build_specs(&tools_config, None).build();
 
@@ -1735,6 +1924,7 @@ mod tests {
             model_info: &model_info,
             features: &features,
             web_search_mode: Some(WebSearchMode::Live),
+            vector_db: config.vector_db,
         });
         let (tools, _) = build_specs(&tools_config, Some(HashMap::new())).build();
 
@@ -1757,6 +1947,7 @@ mod tests {
             model_info: &model_info,
             features: &features,
             web_search_mode: Some(WebSearchMode::Cached),
+            vector_db: config.vector_db,
         });
         let (tools, _) = build_specs(&tools_config, None).build();
 
@@ -1776,6 +1967,7 @@ mod tests {
             model_info: &model_info,
             features: &features,
             web_search_mode: Some(WebSearchMode::Cached),
+            vector_db: config.vector_db,
         });
         let (tools, _) = build_specs(&tools_config, None).build();
 
@@ -1807,6 +1999,7 @@ mod tests {
             model_info: &model_info,
             features: &features,
             web_search_mode: Some(WebSearchMode::Live),
+            vector_db: config.vector_db,
         });
         let (tools, _) = build_specs(
             &tools_config,
@@ -1902,6 +2095,7 @@ mod tests {
             model_info: &model_info,
             features: &features,
             web_search_mode: Some(WebSearchMode::Cached),
+            vector_db: config.vector_db,
         });
 
         // Intentionally construct a map with keys that would sort alphabetically.
@@ -1979,6 +2173,7 @@ mod tests {
             model_info: &model_info,
             features: &features,
             web_search_mode: Some(WebSearchMode::Cached),
+            vector_db: config.vector_db,
         });
 
         let (tools, _) = build_specs(
@@ -2036,6 +2231,7 @@ mod tests {
             model_info: &model_info,
             features: &features,
             web_search_mode: Some(WebSearchMode::Cached),
+            vector_db: config.vector_db,
         });
 
         let (tools, _) = build_specs(
@@ -2090,6 +2286,7 @@ mod tests {
             model_info: &model_info,
             features: &features,
             web_search_mode: Some(WebSearchMode::Cached),
+            vector_db: config.vector_db,
         });
 
         let (tools, _) = build_specs(
@@ -2146,6 +2343,7 @@ mod tests {
             model_info: &model_info,
             features: &features,
             web_search_mode: Some(WebSearchMode::Cached),
+            vector_db: config.vector_db,
         });
 
         let (tools, _) = build_specs(
@@ -2258,6 +2456,7 @@ Examples of valid command strings:
             model_info: &model_info,
             features: &features,
             web_search_mode: Some(WebSearchMode::Cached),
+            vector_db: config.vector_db,
         });
         let (tools, _) = build_specs(
             &tools_config,

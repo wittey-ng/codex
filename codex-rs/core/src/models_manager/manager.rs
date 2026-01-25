@@ -346,8 +346,40 @@ mod tests {
     use core_test_support::responses::mount_models_once;
     use pretty_assertions::assert_eq;
     use serde_json::json;
+    use std::any::Any;
     use tempfile::tempdir;
     use wiremock::MockServer;
+
+    async fn start_mock_server() -> Option<MockServer> {
+        match tokio::spawn(async { MockServer::start().await }).await {
+            Ok(server) => Some(server),
+            Err(err) => {
+                if err.is_panic() {
+                    let panic_payload = err.into_panic();
+                    if is_mock_server_bind_failure(&panic_payload) {
+                        tracing::warn!(
+                            "Skipping test because mock server could not bind to a local port."
+                        );
+                        return None;
+                    }
+                    std::panic::resume_unwind(panic_payload);
+                }
+                panic!("mock server task failed: {err}");
+            }
+        }
+    }
+
+    fn is_mock_server_bind_failure(panic_payload: &Box<dyn Any + Send>) -> bool {
+        let message = if let Some(message) = panic_payload.downcast_ref::<String>() {
+            message.as_str()
+        } else if let Some(message) = panic_payload.downcast_ref::<&str>() {
+            message
+        } else {
+            return false;
+        };
+
+        message.contains("Failed to bind an OS port for a mock server")
+    }
 
     fn remote_model(slug: &str, display: &str, priority: i32) -> ModelInfo {
         remote_model_with_visibility(slug, display, priority, "list")
@@ -404,7 +436,9 @@ mod tests {
 
     #[tokio::test]
     async fn refresh_available_models_sorts_and_marks_default() {
-        let server = MockServer::start().await;
+        let Some(server) = start_mock_server().await else {
+            return;
+        };
         let remote_models = vec![
             remote_model("priority-low", "Low", 1),
             remote_model("priority-high", "High", 0),
@@ -466,7 +500,9 @@ mod tests {
 
     #[tokio::test]
     async fn refresh_available_models_uses_cache_when_fresh() {
-        let server = MockServer::start().await;
+        let Some(server) = start_mock_server().await else {
+            return;
+        };
         let remote_models = vec![remote_model("cached", "Cached", 5)];
         let models_mock = mount_models_once(
             &server,
@@ -521,7 +557,9 @@ mod tests {
 
     #[tokio::test]
     async fn refresh_available_models_refetches_when_cache_stale() {
-        let server = MockServer::start().await;
+        let Some(server) = start_mock_server().await else {
+            return;
+        };
         let initial_models = vec![remote_model("stale", "Stale", 1)];
         let initial_mock = mount_models_once(
             &server,
@@ -594,7 +632,9 @@ mod tests {
 
     #[tokio::test]
     async fn refresh_available_models_drops_removed_remote_models() {
-        let server = MockServer::start().await;
+        let Some(server) = start_mock_server().await else {
+            return;
+        };
         let initial_models = vec![remote_model("remote-old", "Remote Old", 1)];
         let initial_mock = mount_models_once(
             &server,

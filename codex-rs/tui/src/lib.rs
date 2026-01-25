@@ -226,6 +226,7 @@ pub async fn run_main(
         codex_linux_sandbox_exe,
         show_raw_agent_reasoning: cli.oss.then_some(true),
         additional_writable_roots: additional_dirs,
+        agent_role: cli.agent_role,
         ..Default::default()
     };
 

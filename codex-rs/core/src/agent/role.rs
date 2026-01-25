@@ -1,30 +1,36 @@
 use crate::config::Config;
+use crate::features::Feature;
 use crate::protocol::SandboxPolicy;
 use serde::Deserialize;
 use serde::Serialize;
 
 /// Base instructions for the orchestrator role.
 const ORCHESTRATOR_PROMPT: &str = include_str!("../../templates/agents/orchestrator.md");
+/// Base instructions for the research role.
+const RESEARCH_PROMPT: &str = include_str!("../../templates/agents/research.md");
 /// Base instructions for the worker role.
 const WORKER_PROMPT: &str = include_str!("../../gpt-5.2-codex_prompt.md");
 /// Default worker model override used by the worker role.
 const WORKER_MODEL: &str = "gpt-5.2-codex";
 
 /// Enumerated list of all supported agent roles.
-const ALL_ROLES: [AgentRole; 3] = [
+const ALL_ROLES: [AgentRole; 4] = [
     AgentRole::Default,
     AgentRole::Orchestrator,
+    AgentRole::Research,
     AgentRole::Worker,
 ];
 
 /// Hard-coded agent role selection used when spawning sub-agents.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, clap::ValueEnum)]
 #[serde(rename_all = "snake_case")]
 pub enum AgentRole {
     /// Inherit the parent agent's configuration unchanged.
     Default,
     /// Coordination-only agent that delegates to workers.
     Orchestrator,
+    /// Read-only research agent focused on data analysis and synthesis.
+    Research,
     /// Task-executing agent with a fixed model override.
     Worker,
 }
@@ -57,6 +63,11 @@ impl AgentRole {
                 base_instructions: Some(ORCHESTRATOR_PROMPT),
                 ..Default::default()
             },
+            AgentRole::Research => AgentProfile {
+                base_instructions: Some(RESEARCH_PROMPT),
+                read_only: true,
+                ..Default::default()
+            },
             AgentRole::Worker => AgentProfile {
                 base_instructions: Some(WORKER_PROMPT),
                 model: Some(WORKER_MODEL),
@@ -79,6 +90,10 @@ impl AgentRole {
                 .sandbox_policy
                 .set(SandboxPolicy::new_read_only_policy())
                 .map_err(|err| format!("sandbox_policy is invalid: {err}"))?;
+        }
+        // Enable ResearchMode feature for Research role
+        if self == AgentRole::Research {
+            config.features.enable(Feature::ResearchMode);
         }
         Ok(())
     }

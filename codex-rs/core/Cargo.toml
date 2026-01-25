@@ -60,7 +60,7 @@ os_info = { workspace = true }
 rand = { workspace = true }
 regex = { workspace = true }
 regex-lite = { workspace = true }
-reqwest = { workspace = true, features = ["json", "stream"] }
+reqwest = { workspace = true, features = ["json", "multipart", "stream"] }
 schemars = { workspace = true }
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
@@ -96,10 +96,13 @@ url = { workspace = true }
 uuid = { workspace = true, features = ["serde", "v4", "v5"] }
 which = { workspace = true }
 wildmatch = { workspace = true }
+qdrant-client = "1.12"
+boxlite = { path = "/Users/wittey/boxlite/boxlite", optional = true }
 
 [features]
 deterministic_process_ids = []
 test-support = []
+sandbox-tool = ["boxlite"]
 
 
 [target.'cfg(target_os = "linux")'.dependencies]
