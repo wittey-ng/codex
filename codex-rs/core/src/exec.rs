@@ -66,6 +66,7 @@ pub struct ExecParams {
     pub expiration: ExecExpiration,
     pub env: HashMap<String, String>,
     pub sandbox_permissions: SandboxPermissions,
+    pub windows_sandbox_level: codex_protocol::config_types::WindowsSandboxLevel,
     pub justification: Option<String>,
     pub arg0: Option<String>,
 }
@@ -148,7 +149,11 @@ pub async fn process_exec_tool_call(
     codex_linux_sandbox_exe: &Option<PathBuf>,
     stdout_stream: Option<StdoutStream>,
 ) -> Result<ExecToolCallOutput> {
-    let platform_sandbox = get_platform_sandbox().unwrap_or(SandboxType::None);
+    let windows_sandbox_level = params.windows_sandbox_level;
+    let platform_sandbox = get_platform_sandbox(
+        windows_sandbox_level != codex_protocol::config_types::WindowsSandboxLevel::Disabled,
+    )
+    .unwrap_or(SandboxType::None);
     let sandbox_type = match &sandbox_policy {
         SandboxPolicy::DangerFullAccess | SandboxPolicy::ExternalSandbox { .. } => {
             SandboxType::None
@@ -163,6 +168,7 @@ pub async fn process_exec_tool_call(
         expiration,
         env,
         sandbox_permissions,
+        windows_sandbox_level,
         justification,
         arg0: _,
     } = params;
@@ -192,6 +198,7 @@ pub async fn process_exec_tool_call(
             sandbox_type,
             sandbox_cwd,
             codex_linux_sandbox_exe.as_ref(),
+            windows_sandbox_level,
         )
         .map_err(CodexErr::from)?;
 
@@ -210,6 +217,7 @@ pub(crate) async fn execute_exec_env(
         env,
         expiration,
         sandbox,
+        windows_sandbox_level,
         sandbox_permissions,
         justification,
         arg0,
@@ -221,6 +229,7 @@ pub(crate) async fn execute_exec_env(
         expiration,
         env,
         sandbox_permissions,
+        windows_sandbox_level,
         justification,
         arg0,
     };
@@ -232,12 +241,78 @@ pub(crate) async fn execute_exec_env(
 }
 
 #[cfg(target_os = "windows")]
+fn extract_create_process_as_user_error_code(err: &str) -> Option<String> {
+    let marker = "CreateProcessAsUserW failed: ";
+    let start = err.find(marker)? + marker.len();
+    let tail = &err[start..];
+    let digits: String = tail.chars().take_while(char::is_ascii_digit).collect();
+    if digits.is_empty() {
+        None
+    } else {
+        Some(digits)
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn windowsapps_path_kind(path: &str) -> &'static str {
+    let lower = path.to_ascii_lowercase();
+    if lower.contains("\\program files\\windowsapps\\") {
+        return "windowsapps_package";
+    }
+    if lower.contains("\\appdata\\local\\microsoft\\windowsapps\\") {
+        return "windowsapps_alias";
+    }
+    if lower.contains("\\windowsapps\\") {
+        return "windowsapps_other";
+    }
+    "other"
+}
+
+#[cfg(target_os = "windows")]
+fn record_windows_sandbox_spawn_failure(
+    command_path: Option<&str>,
+    windows_sandbox_level: codex_protocol::config_types::WindowsSandboxLevel,
+    err: &str,
+) {
+    let Some(error_code) = extract_create_process_as_user_error_code(err) else {
+        return;
+    };
+    let path = command_path.unwrap_or("unknown");
+    let exe = Path::new(path)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("unknown")
+        .to_ascii_lowercase();
+    let path_kind = windowsapps_path_kind(path);
+    let level = if matches!(
+        windows_sandbox_level,
+        codex_protocol::config_types::WindowsSandboxLevel::Elevated
+    ) {
+        "elevated"
+    } else {
+        "legacy"
+    };
+    if let Some(metrics) = codex_otel::metrics::global() {
+        let _ = metrics.counter(
+            "codex.windows_sandbox.createprocessasuserw_failed",
+            1,
+            &[
+                ("error_code", error_code.as_str()),
+                ("path_kind", path_kind),
+                ("exe", exe.as_str()),
+                ("level", level),
+            ],
+        );
+    }
+}
+
+#[cfg(target_os = "windows")]
 async fn exec_windows_sandbox(
     params: ExecParams,
     sandbox_policy: &SandboxPolicy,
 ) -> Result<RawExecToolCallOutput> {
     use crate::config::find_codex_home;
-    use crate::safety::is_windows_elevated_sandbox_enabled;
+    use codex_protocol::config_types::WindowsSandboxLevel;
     use codex_windows_sandbox::run_windows_sandbox_capture;
     use codex_windows_sandbox::run_windows_sandbox_capture_elevated;
 
@@ -246,6 +321,7 @@ async fn exec_windows_sandbox(
         cwd,
         env,
         expiration,
+        windows_sandbox_level,
         ..
     } = params;
     // TODO(iceweasel-oai): run_windows_sandbox_capture should support all
@@ -263,7 +339,9 @@ async fn exec_windows_sandbox(
             "windows sandbox: failed to resolve codex_home: {err}"
         )))
     })?;
-    let use_elevated = is_windows_elevated_sandbox_enabled();
+    let command_path = command.first().cloned();
+    let sandbox_level = windows_sandbox_level;
+    let use_elevated = matches!(sandbox_level, WindowsSandboxLevel::Elevated);
     let spawn_res = tokio::task::spawn_blocking(move || {
         if use_elevated {
             run_windows_sandbox_capture_elevated(
@@ -292,6 +370,11 @@ async fn exec_windows_sandbox(
     let capture = match spawn_res {
         Ok(Ok(v)) => v,
         Ok(Err(err)) => {
+            record_windows_sandbox_spawn_failure(
+                command_path.as_deref(),
+                sandbox_level,
+                &err.to_string(),
+            );
             return Err(CodexErr::Io(io::Error::other(format!(
                 "windows sandbox: {err}"
             ))));
@@ -320,20 +403,7 @@ async fn exec_windows_sandbox(
         text: stderr_text,
         truncated_after_lines: None,
     };
-    // Best-effort aggregate: stdout then stderr (capped).
-    let mut aggregated = Vec::with_capacity(
-        stdout
-            .text
-            .len()
-            .saturating_add(stderr.text.len())
-            .min(EXEC_OUTPUT_MAX_BYTES),
-    );
-    append_capped(&mut aggregated, &stdout.text, EXEC_OUTPUT_MAX_BYTES);
-    append_capped(&mut aggregated, &stderr.text, EXEC_OUTPUT_MAX_BYTES);
-    let aggregated_output = StreamOutput {
-        text: aggregated,
-        truncated_after_lines: None,
-    };
+    let aggregated_output = aggregate_output(&stdout, &stderr);
 
     Ok(RawExecToolCallOutput {
         exit_status,
@@ -535,6 +605,39 @@ fn append_capped(dst: &mut Vec<u8>, src: &[u8], max_bytes: usize) {
     dst.extend_from_slice(&src[..take]);
 }
 
+fn aggregate_output(
+    stdout: &StreamOutput<Vec<u8>>,
+    stderr: &StreamOutput<Vec<u8>>,
+) -> StreamOutput<Vec<u8>> {
+    let total_len = stdout.text.len().saturating_add(stderr.text.len());
+    let max_bytes = EXEC_OUTPUT_MAX_BYTES;
+    let mut aggregated = Vec::with_capacity(total_len.min(max_bytes));
+
+    if total_len <= max_bytes {
+        aggregated.extend_from_slice(&stdout.text);
+        aggregated.extend_from_slice(&stderr.text);
+        return StreamOutput {
+            text: aggregated,
+            truncated_after_lines: None,
+        };
+    }
+
+    // Under contention, reserve 1/3 for stdout and 2/3 for stderr; rebalance unused stderr to stdout.
+    let want_stdout = stdout.text.len().min(max_bytes / 3);
+    let want_stderr = stderr.text.len();
+    let stderr_take = want_stderr.min(max_bytes.saturating_sub(want_stdout));
+    let remaining = max_bytes.saturating_sub(want_stdout + stderr_take);
+    let stdout_take = want_stdout + remaining.min(stdout.text.len().saturating_sub(want_stdout));
+
+    aggregated.extend_from_slice(&stdout.text[..stdout_take]);
+    aggregated.extend_from_slice(&stderr.text[..stderr_take]);
+
+    StreamOutput {
+        text: aggregated,
+        truncated_after_lines: None,
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct ExecToolCallOutput {
     pub exit_code: i32,
@@ -587,6 +690,7 @@ async fn exec(
         env,
         arg0,
         expiration,
+        windows_sandbox_level: _,
         ..
     } = params;
 
@@ -706,20 +810,7 @@ async fn consume_truncated_output(
         Duration::from_millis(IO_DRAIN_TIMEOUT_MS),
     )
     .await?;
-    // Best-effort aggregate: stdout then stderr (capped).
-    let mut aggregated = Vec::with_capacity(
-        stdout
-            .text
-            .len()
-            .saturating_add(stderr.text.len())
-            .min(EXEC_OUTPUT_MAX_BYTES),
-    );
-    append_capped(&mut aggregated, &stdout.text, EXEC_OUTPUT_MAX_BYTES);
-    append_capped(&mut aggregated, &stderr.text, EXEC_OUTPUT_MAX_BYTES * 2);
-    let aggregated_output = StreamOutput {
-        text: aggregated,
-        truncated_after_lines: None,
-    };
+    let aggregated_output = aggregate_output(&stdout, &stderr);
 
     Ok(RawExecToolCallOutput {
         exit_status,
@@ -1179,6 +1270,7 @@ fn synthetic_exit_status(code: i32) -> ExitStatus {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use pretty_assertions::assert_eq;
     use std::time::Duration;
     use tokio::io::AsyncWriteExt;
 
@@ -1254,6 +1346,85 @@ mod tests {
         assert_eq!(out.text.len(), EXEC_OUTPUT_MAX_BYTES);
     }
 
+    #[test]
+    fn aggregate_output_prefers_stderr_on_contention() {
+        let stdout = StreamOutput {
+            text: vec![b'a'; EXEC_OUTPUT_MAX_BYTES],
+            truncated_after_lines: None,
+        };
+        let stderr = StreamOutput {
+            text: vec![b'b'; EXEC_OUTPUT_MAX_BYTES],
+            truncated_after_lines: None,
+        };
+
+        let aggregated = aggregate_output(&stdout, &stderr);
+        let stdout_cap = EXEC_OUTPUT_MAX_BYTES / 3;
+        let stderr_cap = EXEC_OUTPUT_MAX_BYTES.saturating_sub(stdout_cap);
+
+        assert_eq!(aggregated.text.len(), EXEC_OUTPUT_MAX_BYTES);
+        assert_eq!(aggregated.text[..stdout_cap], vec![b'a'; stdout_cap]);
+        assert_eq!(aggregated.text[stdout_cap..], vec![b'b'; stderr_cap]);
+    }
+
+    #[test]
+    fn aggregate_output_fills_remaining_capacity_with_stderr() {
+        let stdout_len = EXEC_OUTPUT_MAX_BYTES / 10;
+        let stdout = StreamOutput {
+            text: vec![b'a'; stdout_len],
+            truncated_after_lines: None,
+        };
+        let stderr = StreamOutput {
+            text: vec![b'b'; EXEC_OUTPUT_MAX_BYTES],
+            truncated_after_lines: None,
+        };
+
+        let aggregated = aggregate_output(&stdout, &stderr);
+        let stderr_cap = EXEC_OUTPUT_MAX_BYTES.saturating_sub(stdout_len);
+
+        assert_eq!(aggregated.text.len(), EXEC_OUTPUT_MAX_BYTES);
+        assert_eq!(aggregated.text[..stdout_len], vec![b'a'; stdout_len]);
+        assert_eq!(aggregated.text[stdout_len..], vec![b'b'; stderr_cap]);
+    }
+
+    #[test]
+    fn aggregate_output_rebalances_when_stderr_is_small() {
+        let stdout = StreamOutput {
+            text: vec![b'a'; EXEC_OUTPUT_MAX_BYTES],
+            truncated_after_lines: None,
+        };
+        let stderr = StreamOutput {
+            text: vec![b'b'; 1],
+            truncated_after_lines: None,
+        };
+
+        let aggregated = aggregate_output(&stdout, &stderr);
+        let stdout_len = EXEC_OUTPUT_MAX_BYTES.saturating_sub(1);
+
+        assert_eq!(aggregated.text.len(), EXEC_OUTPUT_MAX_BYTES);
+        assert_eq!(aggregated.text[..stdout_len], vec![b'a'; stdout_len]);
+        assert_eq!(aggregated.text[stdout_len..], vec![b'b'; 1]);
+    }
+
+    #[test]
+    fn aggregate_output_keeps_stdout_then_stderr_when_under_cap() {
+        let stdout = StreamOutput {
+            text: vec![b'a'; 4],
+            truncated_after_lines: None,
+        };
+        let stderr = StreamOutput {
+            text: vec![b'b'; 3],
+            truncated_after_lines: None,
+        };
+
+        let aggregated = aggregate_output(&stdout, &stderr);
+        let mut expected = Vec::new();
+        expected.extend_from_slice(&stdout.text);
+        expected.extend_from_slice(&stderr.text);
+
+        assert_eq!(aggregated.text, expected);
+        assert_eq!(aggregated.truncated_after_lines, None);
+    }
+
     #[cfg(unix)]
     #[test]
     fn sandbox_detection_flags_sigsys_exit_code() {
@@ -1286,6 +1457,7 @@ mod tests {
             expiration: 500.into(),
             env,
             sandbox_permissions: SandboxPermissions::UseDefault,
+            windows_sandbox_level: codex_protocol::config_types::WindowsSandboxLevel::Disabled,
             justification: None,
             arg0: None,
         };
@@ -1331,6 +1503,7 @@ mod tests {
             expiration: ExecExpiration::Cancellation(cancel_token),
             env,
             sandbox_permissions: SandboxPermissions::UseDefault,
+            windows_sandbox_level: codex_protocol::config_types::WindowsSandboxLevel::Disabled,
             justification: None,
             arg0: None,
         };

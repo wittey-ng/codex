@@ -1,7 +1,6 @@
 pub mod apply_patch;
 pub(crate) mod collab;
-mod generate_image;
-mod generate_video;
+mod dynamic;
 mod grep_files;
 mod list_dir;
 mod mcp;
@@ -27,8 +26,7 @@ pub use apply_patch::ApplyPatchHandler;
 use codex_api::Provider as ApiProvider;
 use codex_app_server_protocol::AuthMode;
 pub use collab::CollabHandler;
-pub use generate_image::GenerateImageHandler;
-pub use generate_video::GenerateVideoHandler;
+pub use dynamic::DynamicToolHandler;
 pub use grep_files::GrepFilesHandler;
 pub use list_dir::ListDirHandler;
 pub use mcp::McpHandler;
