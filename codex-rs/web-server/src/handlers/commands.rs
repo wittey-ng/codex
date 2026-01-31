@@ -1,12 +1,21 @@
 use axum::Json;
 use axum::extract::State;
+use codex_core::config::Config;
+use codex_core::error::CodexErr;
+use codex_core::error::SandboxErr;
+use codex_core::exec::ExecExpiration;
+use codex_core::exec::ExecParams;
+use codex_core::exec::SandboxType;
+use codex_core::exec::process_exec_tool_call;
+use codex_core::exec_env::create_env;
+use codex_core::get_platform_sandbox;
+use codex_core::protocol::SandboxPolicy;
+use codex_core::sandboxing::SandboxPermissions;
 use serde::Deserialize;
 use serde::Serialize;
+use std::collections::HashMap;
 use std::path::PathBuf;
-use std::process::Stdio;
 use std::result::Result;
-use std::time::Duration;
-use tokio::process::Command;
 use utoipa::ToSchema;
 
 use crate::error::ApiError;
@@ -77,45 +86,54 @@ pub async fn execute_command(
         state.codex_home.clone()
     };
 
-    // Build command
-    let (program, args) = req
-        .command
-        .split_first()
-        .ok_or_else(|| ApiError::InvalidRequest("Command cannot be empty".to_string()))?;
-
-    let mut cmd = Command::new(program);
-    cmd.args(args)
-        .current_dir(&cwd)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .stdin(Stdio::null());
-
-    // Execute with 10s timeout
-    let output = tokio::time::timeout(Duration::from_secs(10), cmd.output())
+    let config = Config::load_with_cli_overrides(vec![])
         .await
-        .map_err(|_| ApiError::Timeout("Command exceeded 10s timeout".to_string()))?
-        .map_err(|e| ApiError::InternalError(format!("Command execution failed: {e}")))?;
+        .map_err(|e| ApiError::InternalError(format!("Failed to load config: {e}")))?;
 
-    // Convert output to strings
-    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
-    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
-    let exit_code = output.status.code().unwrap_or(-1);
+    let sandbox_policy = config.sandbox_policy.get();
+    if matches!(
+        sandbox_policy,
+        SandboxPolicy::DangerFullAccess | SandboxPolicy::ExternalSandbox { .. }
+    ) {
+        return Err(ApiError::InternalError(
+            "Refusing to execute commands with sandbox_policy=DangerFullAccess/ExternalSandbox"
+                .to_string(),
+        ));
+    }
+    if get_platform_sandbox() != Some(SandboxType::BoxLite) {
+        return Err(ApiError::InternalError(
+            "BoxLite sandbox is required for /api/v2/commands; configure BOXLITE_RUNTIME_DIR so BoxLite can locate boxlite-guest/mke2fs/debugfs"
+                .to_string(),
+        ));
+    }
 
-    // Truncate output if too large (1MB limit)
-    let max_output_size = 1_048_576; // 1MB
-    let stdout = if stdout.len() > max_output_size {
-        let truncated = &stdout[..max_output_size];
-        format!("{truncated}... (truncated)")
-    } else {
-        stdout
+    let env: HashMap<String, String> = create_env(&config.shell_environment_policy);
+
+    let params = ExecParams {
+        command: req.command,
+        cwd: cwd.clone(),
+        expiration: ExecExpiration::Timeout(std::time::Duration::from_secs(10)),
+        env,
+        sandbox_permissions: SandboxPermissions::UseDefault,
+        justification: None,
+        arg0: None,
     };
 
-    let stderr = if stderr.len() > max_output_size {
-        let truncated = &stderr[..max_output_size];
-        format!("{truncated}... (truncated)")
-    } else {
-        stderr
-    };
+    let output = process_exec_tool_call(params, sandbox_policy, &cwd, &None, None)
+        .await
+        .map_err(|err| match err {
+            CodexErr::Sandbox(SandboxErr::Timeout { .. }) => {
+                ApiError::Timeout("Command exceeded 10s timeout".to_string())
+            }
+            CodexErr::InvalidRequest(message) | CodexErr::UnsupportedOperation(message) => {
+                ApiError::InvalidRequest(message)
+            }
+            other => ApiError::InternalError(other.to_string()),
+        })?;
+
+    let stdout = output.stdout.text;
+    let stderr = output.stderr.text;
+    let exit_code = output.exit_code;
 
     Ok(Json(ExecuteCommandResponse {
         stdout,

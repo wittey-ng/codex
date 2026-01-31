@@ -123,12 +123,9 @@ pub fn assess_patch_safety(
 }
 
 pub fn get_platform_sandbox() -> Option<SandboxType> {
-    // When sandbox-tool is enabled, use BoxLite only when explicitly configured.
-    #[cfg(feature = "sandbox-tool")]
-    {
-        if boxlite_enabled() {
-            return Some(SandboxType::BoxLite);
-        }
+    #[cfg(all(feature = "sandbox-tool", not(target_os = "windows")))]
+    if boxlite_runtime_available() {
+        return Some(SandboxType::BoxLite);
     }
 
     if cfg!(target_os = "macos") {
@@ -148,21 +145,17 @@ pub fn get_platform_sandbox() -> Option<SandboxType> {
     }
 }
 
-#[cfg(feature = "sandbox-tool")]
-fn boxlite_enabled() -> bool {
-    fn parse_bool(value: &str) -> bool {
-        value == "1" || value.eq_ignore_ascii_case("true")
-    }
+#[cfg(all(feature = "sandbox-tool", not(target_os = "windows")))]
+fn boxlite_runtime_available() -> bool {
+    use std::sync::OnceLock;
 
-    if std::env::var("CODEX_BOXLITE_TESTS").is_ok_and(|value| parse_bool(&value)) {
-        return true;
-    }
-
-    if std::env::var("CODEX_BOXLITE").is_ok_and(|value| parse_bool(&value)) {
-        return true;
-    }
-
-    std::env::var_os("BOXLITE_RUNTIME_DIR").is_some()
+    static AVAILABLE: OnceLock<bool> = OnceLock::new();
+    *AVAILABLE.get_or_init(|| {
+        let finder = boxlite::util::RuntimeBinaryFinder::from_env();
+        ["boxlite-guest", "mke2fs", "debugfs"]
+            .iter()
+            .all(|binary| finder.find(binary).is_ok())
+    })
 }
 
 fn is_write_patch_constrained_to_writable_paths(

@@ -121,6 +121,16 @@ impl Approvable<ShellRequest> for ShellRuntime {
     }
 
     fn sandbox_mode_for_first_attempt(&self, req: &ShellRequest) -> SandboxOverride {
+        #[cfg(feature = "sandbox-tool")]
+        {
+            if matches!(
+                crate::get_platform_sandbox(),
+                Some(crate::exec::SandboxType::BoxLite)
+            ) {
+                return SandboxOverride::NoOverride;
+            }
+        }
+
         if req.sandbox_permissions.requires_escalated_permissions()
             || matches!(
                 req.exec_approval_requirement,

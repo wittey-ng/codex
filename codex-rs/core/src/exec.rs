@@ -148,11 +148,12 @@ pub async fn process_exec_tool_call(
     codex_linux_sandbox_exe: &Option<PathBuf>,
     stdout_stream: Option<StdoutStream>,
 ) -> Result<ExecToolCallOutput> {
+    let platform_sandbox = get_platform_sandbox().unwrap_or(SandboxType::None);
     let sandbox_type = match &sandbox_policy {
         SandboxPolicy::DangerFullAccess | SandboxPolicy::ExternalSandbox { .. } => {
             SandboxType::None
         }
-        _ => get_platform_sandbox().unwrap_or(SandboxType::None),
+        _ => platform_sandbox,
     };
     tracing::debug!("Sandbox type: {sandbox_type:?}");
 
@@ -431,6 +432,14 @@ pub(crate) fn is_likely_sandbox_denied(
     exec_output: &ExecToolCallOutput,
 ) -> bool {
     if sandbox_type == SandboxType::None || exec_output.exit_code == 0 {
+        return false;
+    }
+
+    // BoxLite failures are not host sandbox denials. Treat them as ordinary
+    // command failures so the orchestrator does not attempt an unsafe retry
+    // outside the sandbox.
+    #[cfg(feature = "sandbox-tool")]
+    if sandbox_type == SandboxType::BoxLite {
         return false;
     }
 
@@ -777,25 +786,36 @@ fn synthetic_exit_status(code: i32) -> ExitStatus {
 #[cfg(feature = "sandbox-tool")]
 async fn exec_boxlite(
     params: ExecParams,
-    _sandbox_policy: &SandboxPolicy,
-    _stdout_stream: Option<StdoutStream>,
+    sandbox_policy: &SandboxPolicy,
+    stdout_stream: Option<StdoutStream>,
 ) -> Result<RawExecToolCallOutput> {
     use boxlite::BoxCommand;
     use boxlite::BoxOptions;
     use boxlite::BoxliteRuntime;
     use boxlite::RootfsSpec;
+    use boxlite::runtime::options::NetworkSpec;
+    use boxlite::runtime::options::VolumeSpec;
     use futures::StreamExt;
+    use std::collections::HashSet;
 
     ensure_boxlite_runtime_dir();
 
     let ExecParams {
         command,
         cwd,
+        env,
         expiration,
         ..
     } = params;
 
     tracing::info!("Executing command in BoxLite sandbox: {:?}", command);
+
+    let (program, args_vec) = command.split_first().ok_or_else(|| {
+        CodexErr::Io(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "command args are empty",
+        ))
+    })?;
 
     // Create BoxLite runtime
     let runtime = BoxliteRuntime::default_runtime();
@@ -804,10 +824,61 @@ async fn exec_boxlite(
     let image = select_boxlite_image(&command);
     tracing::debug!("Selected BoxLite image: {}", image);
 
+    let mut volumes = Vec::<VolumeSpec>::new();
+    let mut mounted_paths = HashSet::<String>::new();
+
+    let mut mount = |host_path: &Path, read_only: bool| {
+        let path_str = host_path.to_string_lossy().into_owned();
+        if !mounted_paths.insert(path_str.clone()) {
+            return;
+        }
+
+        volumes.push(VolumeSpec {
+            host_path: path_str.clone(),
+            guest_path: path_str,
+            read_only,
+        });
+    };
+
+    // Always mount the session cwd so tools can operate on the workspace.
+    let cwd_read_only = matches!(sandbox_policy, SandboxPolicy::ReadOnly);
+    mount(&cwd, cwd_read_only);
+
+    // If the command refers to an absolute host binary, make it available in
+    // the guest at the same path.
+    let program_path = Path::new(program);
+    if program_path.is_absolute() && program_path.exists() {
+        mount(program_path, true);
+    }
+
+    // When in WorkspaceWrite mode, mount any additional writable roots and
+    // re-mount sensitive subpaths as read-only.
+    if let SandboxPolicy::WorkspaceWrite { .. } = sandbox_policy {
+        for root in sandbox_policy.get_writable_roots_with_cwd(&cwd) {
+            let root_path = root.root.as_path();
+            // Avoid sharing host-global /tmp with the guest; BoxLite provides an
+            // isolated /tmp inside the VM.
+            if root_path == Path::new("/tmp") {
+                continue;
+            }
+
+            if root_path != cwd.as_path() {
+                mount(root_path, false);
+            }
+
+            for subpath in root.read_only_subpaths {
+                mount(subpath.as_path(), true);
+            }
+        }
+    }
+
     // Configure box options
     let options = BoxOptions {
         rootfs: RootfsSpec::Image(image),
         memory_mib: Some(512),
+        env: env.into_iter().collect(),
+        volumes,
+        network: NetworkSpec::Isolated,
         ..Default::default()
     };
 
@@ -818,131 +889,180 @@ async fn exec_boxlite(
         )))
     })?;
 
-    // Build command (BoxCommand doesn't support current_dir, will use image's default)
-    let (program, args_vec) = command.split_first().ok_or_else(|| {
-        CodexErr::Io(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "command args are empty",
-        ))
-    })?;
+    let timeout_ms = expiration.timeout_ms();
+    let cwd_str = cwd.to_string_lossy().into_owned();
 
-    // If cwd is specified and different from root, prepend 'cd' command
-    let box_command = if cwd.as_os_str() != "/" && cwd.as_os_str() != "" {
-        let cd_and_exec = format!("cd {} && {} {}", cwd.display(), program, args_vec.join(" "));
-        let mut cmd = BoxCommand::new("sh");
-        cmd = cmd.arg("-c");
-        cmd = cmd.arg(cd_and_exec);
-        cmd
-    } else {
-        let mut cmd = BoxCommand::new(program);
-        for arg in args_vec {
-            cmd = cmd.arg(arg);
-        }
-        cmd
-    };
+    let mut box_command = BoxCommand::new(program.clone()).args(args_vec.iter().cloned());
+    box_command = box_command.working_dir(cwd_str);
+    if let Some(timeout_ms) = timeout_ms {
+        box_command = box_command.timeout(Duration::from_millis(timeout_ms));
+    }
 
-    // Execute with timeout
-    let exec_future = async {
-        let mut execution = litebox
-            .exec(box_command)
-            .await
-            .map_err(|e| CodexErr::Io(io::Error::other(format!("BoxLite exec failed: {e}"))))?;
+    let mut execution = litebox
+        .exec(box_command)
+        .await
+        .map_err(|e| CodexErr::Io(io::Error::other(format!("BoxLite exec failed: {e}"))))?;
 
-        // Collect stdout
-        let mut stdout_content = Vec::new();
-        if let Some(mut stdout) = execution.stdout() {
-            while let Some(line) = stdout.next().await {
-                stdout_content.extend_from_slice(line.as_bytes());
-                stdout_content.push(b'\n');
+    async fn read_stream(
+        mut stream: impl futures::Stream<Item = String> + Unpin,
+        stdout_stream: Option<StdoutStream>,
+        is_stderr: bool,
+    ) -> StreamOutput<Vec<u8>> {
+        let mut buf =
+            Vec::with_capacity(AGGREGATE_BUFFER_INITIAL_CAPACITY.min(EXEC_OUTPUT_MAX_BYTES));
+        let mut emitted_deltas: usize = 0;
+        while let Some(line) = stream.next().await {
+            let mut bytes = line.into_bytes();
+            bytes.push(b'\n');
+
+            if let Some(stream) = &stdout_stream
+                && emitted_deltas < MAX_EXEC_OUTPUT_DELTAS_PER_CALL
+            {
+                let msg = EventMsg::ExecCommandOutputDelta(ExecCommandOutputDeltaEvent {
+                    call_id: stream.call_id.clone(),
+                    stream: if is_stderr {
+                        ExecOutputStream::Stderr
+                    } else {
+                        ExecOutputStream::Stdout
+                    },
+                    chunk: bytes.clone(),
+                });
+                let event = Event {
+                    id: stream.sub_id.clone(),
+                    msg,
+                };
+                #[allow(clippy::let_unit_value)]
+                let _ = stream.tx_event.send(event).await;
+                emitted_deltas += 1;
             }
+
+            append_capped(&mut buf, &bytes, EXEC_OUTPUT_MAX_BYTES);
         }
 
-        // Collect stderr
-        let mut stderr_content = Vec::new();
-        if let Some(mut stderr) = execution.stderr() {
-            while let Some(line) = stderr.next().await {
-                stderr_content.extend_from_slice(line.as_bytes());
-                stderr_content.push(b'\n');
-            }
+        StreamOutput {
+            text: buf,
+            truncated_after_lines: None,
         }
+    }
 
-        // Wait for exit code
-        let result = execution
-            .wait()
-            .await
-            .map_err(|e| CodexErr::Io(io::Error::other(format!("BoxLite wait failed: {e}"))))?;
-        let exit_code = result.code();
+    let stdout_handle = execution.stdout().map(|stdout| {
+        let stdout_stream = stdout_stream.clone();
+        tokio::spawn(read_stream(stdout, stdout_stream, false))
+    });
+    let stderr_handle = execution.stderr().map(|stderr| {
+        let stdout_stream = stdout_stream.clone();
+        tokio::spawn(read_stream(stderr, stdout_stream, true))
+    });
 
-        Ok::<_, CodexErr>((stdout_content, stderr_content, exit_code))
-    };
-
-    // Apply timeout or cancellation
-    let result_with_timeout = match &expiration {
-        ExecExpiration::Timeout(timeout_duration) => {
-            match tokio::time::timeout(*timeout_duration, exec_future).await {
-                Ok(result) => result.map(Some),
-                Err(_) => Ok(None), // Timeout occurred
+    let (exit_code, timed_out) = match expiration {
+        ExecExpiration::Timeout(duration) => {
+            match tokio::time::timeout(duration, execution.wait()).await {
+                Ok(result) => (
+                    result
+                        .map_err(|e| {
+                            CodexErr::Io(io::Error::other(format!("BoxLite wait failed: {e}")))
+                        })?
+                        .code(),
+                    false,
+                ),
+                Err(_) => {
+                    let _ = execution.kill().await;
+                    (EXEC_TIMEOUT_EXIT_CODE, true)
+                }
             }
         }
         ExecExpiration::DefaultTimeout => {
-            let timeout_duration = Duration::from_millis(DEFAULT_EXEC_COMMAND_TIMEOUT_MS);
-            match tokio::time::timeout(timeout_duration, exec_future).await {
-                Ok(result) => result.map(Some),
-                Err(_) => Ok(None), // Timeout occurred
+            let duration = Duration::from_millis(DEFAULT_EXEC_COMMAND_TIMEOUT_MS);
+            match tokio::time::timeout(duration, execution.wait()).await {
+                Ok(result) => (
+                    result
+                        .map_err(|e| {
+                            CodexErr::Io(io::Error::other(format!("BoxLite wait failed: {e}")))
+                        })?
+                        .code(),
+                    false,
+                ),
+                Err(_) => {
+                    let _ = execution.kill().await;
+                    (EXEC_TIMEOUT_EXIT_CODE, true)
+                }
             }
         }
         ExecExpiration::Cancellation(cancel_token) => {
             tokio::select! {
-                result = exec_future => result.map(Some),
-                _ = cancel_token.cancelled() => Ok(None), // Cancelled
+                result = execution.wait() => (result.map_err(|e| CodexErr::Io(io::Error::other(format!("BoxLite wait failed: {e}"))))?.code(), false),
+                _ = cancel_token.cancelled() => {
+                    let _ = execution.kill().await;
+                    (EXEC_TIMEOUT_EXIT_CODE, true)
+                }
             }
         }
     };
 
-    match result_with_timeout? {
-        Some((stdout_content, stderr_content, exit_code)) => {
-            // Create aggregated output
-            let mut aggregated = stdout_content.clone();
-            aggregated.extend_from_slice(&stderr_content);
-
-            Ok(RawExecToolCallOutput {
-                exit_status: synthetic_exit_status(exit_code),
-                stdout: StreamOutput {
-                    text: stdout_content,
-                    truncated_after_lines: None,
-                },
-                stderr: StreamOutput {
-                    text: stderr_content,
-                    truncated_after_lines: None,
-                },
-                aggregated_output: StreamOutput {
-                    text: aggregated,
-                    truncated_after_lines: None,
-                },
-                timed_out: false,
-            })
-        }
-        None => {
-            // Timeout or cancellation occurred
-            let error_msg = b"Execution timed out or was cancelled".to_vec();
-            Ok(RawExecToolCallOutput {
-                exit_status: synthetic_exit_status(EXEC_TIMEOUT_EXIT_CODE),
-                stdout: StreamOutput {
+    const IO_DRAIN_TIMEOUT_MS: u64 = 2_000;
+    async fn await_handle(
+        mut handle: tokio::task::JoinHandle<StreamOutput<Vec<u8>>>,
+    ) -> Result<StreamOutput<Vec<u8>>> {
+        match tokio::time::timeout(Duration::from_millis(IO_DRAIN_TIMEOUT_MS), &mut handle).await {
+            Ok(joined) => joined.map_err(CodexErr::from),
+            Err(_) => {
+                handle.abort();
+                Ok(StreamOutput {
                     text: Vec::new(),
                     truncated_after_lines: None,
-                },
-                stderr: StreamOutput {
-                    text: error_msg.clone(),
-                    truncated_after_lines: None,
-                },
-                aggregated_output: StreamOutput {
-                    text: error_msg,
-                    truncated_after_lines: None,
-                },
-                timed_out: true,
-            })
+                })
+            }
         }
     }
+
+    let stdout = match stdout_handle {
+        Some(handle) => await_handle(handle).await?,
+        None => StreamOutput {
+            text: Vec::new(),
+            truncated_after_lines: None,
+        },
+    };
+    let stderr = match stderr_handle {
+        Some(handle) => await_handle(handle).await?,
+        None => StreamOutput {
+            text: Vec::new(),
+            truncated_after_lines: None,
+        },
+    };
+
+    let mut aggregated = Vec::with_capacity(
+        stdout
+            .text
+            .len()
+            .saturating_add(stderr.text.len())
+            .min(EXEC_OUTPUT_MAX_BYTES),
+    );
+    append_capped(&mut aggregated, &stdout.text, EXEC_OUTPUT_MAX_BYTES);
+    append_capped(&mut aggregated, &stderr.text, EXEC_OUTPUT_MAX_BYTES);
+    let aggregated_output = StreamOutput {
+        text: aggregated,
+        truncated_after_lines: None,
+    };
+
+    #[cfg(unix)]
+    let exit_status = if timed_out {
+        synthetic_exit_status(EXIT_CODE_SIGNAL_BASE + TIMEOUT_CODE)
+    } else if exit_code >= 0 {
+        synthetic_exit_status(exit_code << 8)
+    } else {
+        synthetic_exit_status(-exit_code)
+    };
+
+    #[cfg(windows)]
+    let exit_status = synthetic_exit_status(exit_code);
+
+    Ok(RawExecToolCallOutput {
+        exit_status,
+        stdout,
+        stderr,
+        aggregated_output,
+        timed_out,
+    })
 }
 
 #[cfg(feature = "sandbox-tool")]
@@ -1021,9 +1141,16 @@ fn sync_boxlite_runtime(source_dir: &Path, target_dir: &Path) -> io::Result<()> 
 
 #[cfg(feature = "sandbox-tool")]
 fn select_boxlite_image(command: &[String]) -> String {
+    if let Ok(image) = std::env::var("CODEX_BOXLITE_IMAGE") {
+        let trimmed = image.trim();
+        if !trimmed.is_empty() {
+            return trimmed.to_string();
+        }
+    }
+
     // Simple heuristic to select image based on program name
     if command.is_empty() {
-        return "alpine:latest".to_string();
+        return "debian:bookworm-slim".to_string();
     }
 
     let program = command[0].to_lowercase();
@@ -1031,14 +1158,13 @@ fn select_boxlite_image(command: &[String]) -> String {
     if program.contains("python") || program == "python3" || program == "python2" {
         "python:3.11-slim".to_string()
     } else if program.contains("node") || program == "npm" || program == "npx" {
-        "node:20-alpine".to_string()
+        "node:20-slim".to_string()
     } else if program.contains("cargo") || program.contains("rustc") {
-        "rust:1.92-alpine".to_string()
-    } else if program == "sh" || program == "bash" || program.contains("shell") {
-        "alpine:latest".to_string()
+        "rust:1.92-slim".to_string()
     } else {
-        // Default to alpine for unknown commands
-        "alpine:latest".to_string()
+        // Default to a glibc-based image so we can run typical Linux tooling,
+        // including `bash -lc` commands and (when mounted) host-built binaries.
+        "debian:bookworm-slim".to_string()
     }
 }
 
