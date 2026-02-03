@@ -5,6 +5,7 @@
 // the TUI or the tracing stack).
 #![deny(clippy::print_stdout, clippy::print_stderr)]
 
+mod analytics_client;
 pub mod api_bridge;
 mod apply_patch;
 pub mod auth;
@@ -49,6 +50,7 @@ mod message_history;
 mod model_provider_info;
 pub mod parse_command;
 pub mod path_utils;
+pub mod personality_migration;
 pub mod powershell;
 mod proposed_plan_parser;
 pub mod sandboxing;
@@ -100,6 +102,7 @@ pub mod state_db;
 pub mod terminal;
 mod tools;
 pub mod turn_diff_tracker;
+mod turn_metadata;
 pub use rollout::ARCHIVED_SESSIONS_SUBDIR;
 pub use rollout::INTERACTIVE_SESSION_SOURCES;
 pub use rollout::RolloutRecorder;
@@ -119,6 +122,7 @@ pub use rollout::list::parse_cursor;
 pub use rollout::list::read_head_for_summary;
 pub use rollout::list::read_session_meta_line;
 pub use rollout::rollout_date_parts;
+pub use rollout::session_index::find_thread_names_by_ids;
 pub use transport_manager::TransportManager;
 mod function_tool;
 mod state;
@@ -129,6 +133,7 @@ pub mod util;
 
 pub use apply_patch::CODEX_APPLY_PATCH_ARG1;
 pub use client::WEB_SEARCH_ELIGIBLE_HEADER;
+pub use client::X_CODEX_TURN_METADATA_HEADER;
 pub use command_safety::is_dangerous_command;
 pub use command_safety::is_safe_command;
 pub use exec_policy::ExecPolicyError;

@@ -114,7 +114,6 @@ mod wrapping;
 #[cfg(test)]
 pub mod test_backend;
 
-use crate::onboarding::TrustDirectorySelection;
 use crate::onboarding::onboarding_screen::OnboardingScreenArgs;
 use crate::onboarding::onboarding_screen::run_onboarding_app;
 use crate::tui::Tui;
@@ -208,6 +207,13 @@ pub async fn run_main(
             std::process::exit(1);
         }
     };
+
+    if let Err(err) =
+        codex_core::personality_migration::maybe_migrate_personality(&codex_home, &config_toml)
+            .await
+    {
+        tracing::warn!(error = %err, "failed to run personality migration");
+    }
 
     let cloud_auth_manager = AuthManager::shared(
         codex_home.to_path_buf(),
@@ -488,12 +494,9 @@ async fn run_ratatui_app(
                 exit_reason: ExitReason::UserRequested,
             });
         }
-        // if the user acknowledged windows or made an explicit decision ato trust the directory, reload the config accordingly
-        if onboarding_result
-            .directory_trust_decision
-            .map(|d| d == TrustDirectorySelection::Trust)
-            .unwrap_or(false)
-        {
+        // If the user made an explicit trust decision, reload config so current
+        // process state reflects what was persisted to config.toml.
+        if onboarding_result.directory_trust_decision.is_some() {
             load_config_or_exit(
                 cli_kv_overrides.clone(),
                 overrides.clone(),
