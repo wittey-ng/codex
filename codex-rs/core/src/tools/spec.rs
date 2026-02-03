@@ -33,6 +33,7 @@ pub(crate) struct ToolsConfig {
     pub collaboration_modes_tools: bool,
     pub request_rule_enabled: bool,
     pub experimental_supported_tools: Vec<String>,
+    pub vector_db: VectorDbConfig,
 }
 
 pub(crate) struct ToolsConfigParams<'a> {
@@ -104,6 +105,7 @@ impl ToolsConfig {
             collaboration_modes_tools: include_collaboration_modes_tools,
             request_rule_enabled,
             experimental_supported_tools,
+            vector_db: vector_db.clone(),
         }
     }
 }
@@ -1420,6 +1422,8 @@ pub(crate) fn build_specs(
     use crate::tools::handlers::ApplyPatchHandler;
     use crate::tools::handlers::CollabHandler;
     use crate::tools::handlers::DynamicToolHandler;
+    use crate::tools::handlers::GenerateImageHandler;
+    use crate::tools::handlers::GenerateVideoHandler;
     use crate::tools::handlers::GrepFilesHandler;
     use crate::tools::handlers::ListDirHandler;
     use crate::tools::handlers::McpHandler;
@@ -1443,7 +1447,9 @@ pub(crate) fn build_specs(
     let apply_patch_handler = Arc::new(ApplyPatchHandler);
     let dynamic_tool_handler = Arc::new(DynamicToolHandler);
     let view_image_handler = Arc::new(ViewImageHandler);
-    let query_vector_db_handler = Arc::new(QueryVectorDbHandler::new());
+    let query_vector_db_handler = Arc::new(QueryVectorDbHandler::new(config.vector_db.clone()));
+    let generate_image_handler = Arc::new(GenerateImageHandler);
+    let generate_video_handler = Arc::new(GenerateVideoHandler);
     let mcp_handler = Arc::new(McpHandler);
     let mcp_resource_handler = Arc::new(McpResourceHandler);
     let shell_command_handler = Arc::new(ShellCommandHandler);
@@ -1561,6 +1567,12 @@ pub(crate) fn build_specs(
 
     builder.push_spec_with_parallel_support(create_query_vector_db_tool(), true);
     builder.register_handler("query_vector_db", query_vector_db_handler);
+
+    builder.push_spec_with_parallel_support(create_generate_image_tool(), true);
+    builder.register_handler("generate_image", generate_image_handler);
+
+    builder.push_spec_with_parallel_support(create_generate_video_tool(), true);
+    builder.register_handler("generate_video", generate_video_handler);
 
     if config.collab_tools {
         let collab_handler = Arc::new(CollabHandler);

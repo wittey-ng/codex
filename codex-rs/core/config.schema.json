@@ -205,6 +205,9 @@
             "request_rule": {
               "type": "boolean"
             },
+            "research_mode": {
+              "type": "boolean"
+            },
             "responses_websockets": {
               "type": "boolean"
             },
@@ -1249,6 +1252,9 @@
           "type": "boolean"
         },
         "request_rule": {
+          "type": "boolean"
+        },
+        "research_mode": {
           "type": "boolean"
         },
         "responses_websockets": {

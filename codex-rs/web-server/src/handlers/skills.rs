@@ -1,6 +1,7 @@
 use axum::Json;
 use axum::extract::Path;
 use axum::extract::State;
+use codex_app_server_protocol::SkillDependencies;
 use codex_app_server_protocol::SkillErrorInfo;
 use codex_app_server_protocol::SkillInterface;
 use codex_app_server_protocol::SkillMetadata;
@@ -184,6 +185,20 @@ fn skills_to_info(
                     icon_large: interface.icon_large,
                     brand_color: interface.brand_color,
                     default_prompt: interface.default_prompt,
+                }),
+                dependencies: skill.dependencies.clone().map(|deps| SkillDependencies {
+                    tools: deps
+                        .tools
+                        .iter()
+                        .map(|tool| codex_app_server_protocol::SkillToolDependency {
+                            r#type: tool.r#type.clone(),
+                            value: tool.value.clone(),
+                            description: tool.description.clone(),
+                            transport: tool.transport.clone(),
+                            command: tool.command.clone(),
+                            url: tool.url.clone(),
+                        })
+                        .collect(),
                 }),
                 path: skill.path.clone(),
                 scope: skill.scope.into(),

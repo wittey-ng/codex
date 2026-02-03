@@ -24,6 +24,7 @@ use codex_protocol::openai_models::ModelPreset;
 use codex_protocol::protocol::InitialHistory;
 use codex_protocol::protocol::McpServerRefreshConfig;
 use codex_protocol::protocol::Op;
+use codex_protocol::protocol::ResumedHistory;
 use codex_protocol::protocol::RolloutItem;
 use codex_protocol::protocol::SessionSource;
 use std::collections::HashMap;
@@ -226,6 +227,29 @@ impl ThreadManager {
             .await
     }
 
+    pub async fn resume_thread_from_postgres(
+        &self,
+        config: Config,
+        thread_id: ThreadId,
+        auth_manager: Arc<AuthManager>,
+    ) -> CodexResult<NewThread> {
+        let history = crate::rollout::postgres::load_rollout_items(thread_id)
+            .await
+            .map_err(CodexErr::Io)?;
+        let initial_history = InitialHistory::Resumed(ResumedHistory {
+            conversation_id: thread_id,
+            history,
+            // Placeholder path for compatibility with existing rollout types.
+            // File-backed persistence will ignore this code path.
+            rollout_path: config
+                .codex_home
+                .join(crate::rollout::SESSIONS_SUBDIR)
+                .join(format!("postgres-{thread_id}.jsonl")),
+        });
+        self.resume_thread_with_history(config, initial_history, auth_manager)
+            .await
+    }
+
     pub async fn resume_thread_with_history(
         &self,
         config: Config,
@@ -271,6 +295,28 @@ impl ThreadManager {
     ) -> CodexResult<NewThread> {
         let history = RolloutRecorder::get_rollout_history(&path).await?;
         let history = truncate_before_nth_user_message(history, nth_user_message);
+        self.state
+            .spawn_thread(
+                config,
+                history,
+                Arc::clone(&self.state.auth_manager),
+                self.agent_control(),
+                Vec::new(),
+            )
+            .await
+    }
+
+    pub async fn fork_thread_from_postgres(
+        &self,
+        nth_user_message: usize,
+        config: Config,
+        thread_id: ThreadId,
+    ) -> CodexResult<NewThread> {
+        let history = crate::rollout::postgres::load_rollout_items(thread_id)
+            .await
+            .map_err(CodexErr::Io)?;
+        let history =
+            truncate_before_nth_user_message(InitialHistory::Forked(history), nth_user_message);
         self.state
             .spawn_thread(
                 config,

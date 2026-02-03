@@ -760,6 +760,8 @@ impl EventStreamProcessor {
             ServerNotification::AuthStatusChange(_) => "authStatusChange",
             ServerNotification::LoginChatGptComplete(_) => "loginChatGptComplete",
             ServerNotification::SessionConfigured(_) => "sessionConfigured",
+            ServerNotification::ThreadNameUpdated(_) => "thread/name/updated",
+            ServerNotification::PlanDelta(_) => "item/plan/delta",
         }
     }
 }

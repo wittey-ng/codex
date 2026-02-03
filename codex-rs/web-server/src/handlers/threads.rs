@@ -2,9 +2,11 @@ use axum::Json;
 use axum::extract::Path;
 use axum::extract::State;
 use codex_core::config::Config;
+use codex_core::error::CodexErr;
 use codex_protocol::ThreadId;
 use serde::Deserialize;
 use serde::Serialize;
+use std::io::ErrorKind;
 use utoipa::ToSchema;
 
 use crate::error::ApiError;
@@ -171,30 +173,46 @@ pub async fn resume_thread(
         }));
     }
 
-    // Construct rollout path: ~/.codex/sessions/{thread_id}.jsonl
-    let rollout_path = state
-        .codex_home
-        .join("sessions")
-        .join(format!("{thread_id}.jsonl"));
-
-    // Verify rollout file exists
-    if !rollout_path.exists() {
-        return Err(ApiError::NotFound(format!(
-            "Rollout file not found for thread: {thread_id}"
-        )));
-    }
-
     // Load config (could support overrides in future)
     let config = Config::load_with_cli_overrides(vec![])
         .await
         .map_err(|e| ApiError::InternalError(format!("Failed to load config: {e}")))?;
 
-    // Resume thread from rollout file
-    let new_thread = state
-        .thread_manager
-        .resume_thread_from_rollout(config, rollout_path, state.auth_manager.clone())
-        .await
-        .map_err(|e| ApiError::InternalError(format!("Failed to resume thread: {e}")))?;
+    // Prefer Postgres-backed rollouts when configured.
+    let postgres_enabled = std::env::var("CODEX_ROLLOUT_POSTGRES_URL")
+        .ok()
+        .is_some_and(|value| !value.trim().is_empty());
+
+    let new_thread = if postgres_enabled {
+        state
+            .thread_manager
+            .resume_thread_from_postgres(config, thread_id, state.auth_manager.clone())
+            .await
+            .map_err(|err| match err {
+                CodexErr::Io(io) if io.kind() == ErrorKind::NotFound => {
+                    ApiError::NotFound(format!("Rollout history not found for thread: {thread_id}"))
+                }
+                CodexErr::ThreadNotFound(_) => {
+                    ApiError::NotFound(format!("Rollout history not found for thread: {thread_id}"))
+                }
+                other => ApiError::InternalError(format!("Failed to resume thread: {other}")),
+            })?
+    } else {
+        let Some(rollout_path) =
+            codex_core::find_thread_path_by_id_str(&state.codex_home, &thread_id.to_string())
+                .await
+                .map_err(|e| ApiError::InternalError(format!("Failed to locate rollout: {e}")))?
+        else {
+            return Err(ApiError::NotFound(format!(
+                "Rollout file not found for thread: {thread_id}"
+            )));
+        };
+        state
+            .thread_manager
+            .resume_thread_from_rollout(config, rollout_path, state.auth_manager.clone())
+            .await
+            .map_err(|e| ApiError::InternalError(format!("Failed to resume thread: {e}")))?
+    };
 
     Ok(Json(ResumeThreadResponse {
         success: true,
@@ -245,28 +263,43 @@ pub async fn fork_thread(
     let _turn_id = req.turn_id;
 
     // Get rollout path for the source thread
-    let source_thread = state
-        .thread_manager
-        .get_thread(source_thread_id)
-        .await
-        .map_err(|_| ApiError::ThreadNotFound)?;
-
-    let rollout_path = source_thread
-        .rollout_path()
-        .ok_or_else(|| ApiError::InvalidRequest("Source thread has no rollout path".to_string()))?;
-
     // Load config (TODO: support config overrides from request)
     let config = Config::load_with_cli_overrides(vec![])
         .await
         .map_err(|e| ApiError::InternalError(format!("Failed to load config: {e}")))?;
 
+    // Prefer Postgres-backed rollouts when configured.
+    let postgres_enabled = std::env::var("CODEX_ROLLOUT_POSTGRES_URL")
+        .ok()
+        .is_some_and(|value| !value.trim().is_empty());
+
     // Fork the thread (usize::MAX keeps full history, matching app-server behavior)
     // NOTE: turn_id is currently ignored - app-server doesn't support partial forks via JSON-RPC
-    let new_thread = state
-        .thread_manager
-        .fork_thread(usize::MAX, config, rollout_path)
-        .await
-        .map_err(|e| ApiError::InternalError(format!("Failed to fork thread: {e}")))?;
+    let new_thread = if postgres_enabled {
+        state
+            .thread_manager
+            .fork_thread_from_postgres(usize::MAX, config, source_thread_id)
+            .await
+            .map_err(|err| match err {
+                CodexErr::Io(io) if io.kind() == ErrorKind::NotFound => ApiError::ThreadNotFound,
+                CodexErr::ThreadNotFound(_) => ApiError::ThreadNotFound,
+                other => ApiError::InternalError(format!("Failed to fork thread: {other}")),
+            })?
+    } else {
+        let source_thread = state
+            .thread_manager
+            .get_thread(source_thread_id)
+            .await
+            .map_err(|_| ApiError::ThreadNotFound)?;
+        let rollout_path = source_thread.rollout_path().ok_or_else(|| {
+            ApiError::InvalidRequest("Source thread has no rollout path".to_string())
+        })?;
+        state
+            .thread_manager
+            .fork_thread(usize::MAX, config, rollout_path)
+            .await
+            .map_err(|e| ApiError::InternalError(format!("Failed to fork thread: {e}")))?
+    };
 
     let new_thread_id = new_thread.thread_id;
 

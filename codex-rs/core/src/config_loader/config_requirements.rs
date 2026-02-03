@@ -201,7 +201,7 @@ impl From<SandboxMode> for SandboxModeRequirement {
     }
 }
 
-#[derive(Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Deserialize, Serialize, Debug, Clone, Copy, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
 pub enum ResidencyRequirement {
     Us,

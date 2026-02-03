@@ -124,7 +124,7 @@ impl Approvable<ShellRequest> for ShellRuntime {
         #[cfg(feature = "sandbox-tool")]
         {
             if matches!(
-                crate::get_platform_sandbox(),
+                crate::get_platform_sandbox(false),
                 Some(crate::exec::SandboxType::BoxLite)
             ) {
                 return SandboxOverride::NoOverride;

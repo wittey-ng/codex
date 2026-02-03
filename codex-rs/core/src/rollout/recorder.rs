@@ -1,4 +1,4 @@
-//! Persist Codex session rollouts (.jsonl) so sessions can be replayed or inspected later.
+//! Persist Codex session rollouts so sessions can be replayed or inspected later.
 
 use std::fs::File;
 use std::fs::{self};
@@ -58,7 +58,7 @@ use codex_state::ThreadMetadataBuilder;
 #[derive(Clone)]
 pub struct RolloutRecorder {
     tx: Sender<RolloutCmd>,
-    pub(crate) rollout_path: PathBuf,
+    pub(crate) rollout_path: Option<PathBuf>,
     state_db: Option<StateDbHandle>,
 }
 
@@ -72,7 +72,8 @@ pub enum RolloutRecorderParams {
         dynamic_tools: Vec<DynamicToolSpec>,
     },
     Resume {
-        path: PathBuf,
+        conversation_id: ThreadId,
+        path: Option<PathBuf>,
     },
 }
 
@@ -104,8 +105,11 @@ impl RolloutRecorderParams {
         }
     }
 
-    pub fn resume(path: PathBuf) -> Self {
-        Self::Resume { path }
+    pub fn resume(conversation_id: ThreadId, path: Option<PathBuf>) -> Self {
+        Self::Resume {
+            conversation_id,
+            path,
+        }
     }
 }
 
@@ -257,6 +261,63 @@ impl RolloutRecorder {
         state_db_ctx: Option<StateDbHandle>,
         state_builder: Option<ThreadMetadataBuilder>,
     ) -> std::io::Result<Self> {
+        if super::postgres::rollout_postgres_url_from_env().is_some() {
+            let (conversation_id, meta) = match params {
+                RolloutRecorderParams::Create {
+                    conversation_id,
+                    forked_from_id,
+                    source,
+                    base_instructions,
+                    dynamic_tools,
+                } => {
+                    let timestamp_format: &[FormatItem] = format_description!(
+                        "[year]-[month]-[day]T[hour]:[minute]:[second].[subsecond digits:3]Z"
+                    );
+                    let timestamp = OffsetDateTime::now_utc()
+                        .format(timestamp_format)
+                        .map_err(|e| IoError::other(format!("failed to format timestamp: {e}")))?;
+                    let meta = SessionMeta {
+                        id: conversation_id,
+                        forked_from_id,
+                        timestamp,
+                        cwd: config.cwd.clone(),
+                        originator: originator().value,
+                        cli_version: env!("CARGO_PKG_VERSION").to_string(),
+                        source,
+                        model_provider: Some(config.model_provider_id.clone()),
+                        base_instructions: Some(base_instructions),
+                        dynamic_tools: if dynamic_tools.is_empty() {
+                            None
+                        } else {
+                            Some(dynamic_tools)
+                        },
+                    };
+                    (conversation_id, Some(meta))
+                }
+                RolloutRecorderParams::Resume {
+                    conversation_id,
+                    path: _,
+                } => (conversation_id, None),
+            };
+
+            let pool = super::postgres::connect_rollout_pool().await?;
+            let cwd = config.cwd.clone();
+            let (tx, rx) = mpsc::channel::<RolloutCmd>(256);
+            tokio::task::spawn(postgres_rollout_writer(
+                pool,
+                rx,
+                meta,
+                cwd,
+                conversation_id,
+            ));
+
+            return Ok(Self {
+                tx,
+                rollout_path: None,
+                state_db: state_db_ctx,
+            });
+        }
+
         let (file, rollout_path, meta) = match params {
             RolloutRecorderParams::Create {
                 conversation_id,
@@ -301,14 +362,24 @@ impl RolloutRecorder {
                     }),
                 )
             }
-            RolloutRecorderParams::Resume { path } => (
-                tokio::fs::OpenOptions::new()
-                    .append(true)
-                    .open(&path)
-                    .await?,
+            RolloutRecorderParams::Resume {
+                conversation_id: _,
                 path,
-                None,
-            ),
+            } => {
+                let Some(path) = path else {
+                    return Err(IoError::other(
+                        "RolloutRecorderParams::Resume requires a rollout path for file-backed persistence",
+                    ));
+                };
+                (
+                    tokio::fs::OpenOptions::new()
+                        .append(true)
+                        .open(&path)
+                        .await?,
+                    path,
+                    None,
+                )
+            }
         };
 
         // Clone the cwd for the spawned task to collect git info asynchronously
@@ -335,13 +406,13 @@ impl RolloutRecorder {
 
         Ok(Self {
             tx,
-            rollout_path,
+            rollout_path: Some(rollout_path),
             state_db: state_db_ctx,
         })
     }
 
-    pub fn rollout_path(&self) -> &Path {
-        self.rollout_path.as_path()
+    pub fn rollout_path(&self) -> Option<&Path> {
+        self.rollout_path.as_deref()
     }
 
     pub fn state_db(&self) -> Option<StateDbHandle> {
@@ -523,6 +594,56 @@ fn create_log_file(config: &Config, conversation_id: ThreadId) -> std::io::Resul
         conversation_id,
         timestamp,
     })
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn postgres_rollout_writer(
+    pool: sqlx::PgPool,
+    mut rx: mpsc::Receiver<RolloutCmd>,
+    mut meta: Option<SessionMeta>,
+    cwd: std::path::PathBuf,
+    conversation_id: ThreadId,
+) -> std::io::Result<()> {
+    // If we have a meta, collect git info asynchronously and write meta first.
+    if let Some(session_meta) = meta.take() {
+        let git_info = collect_git_info(&cwd).await;
+        let session_meta_line = SessionMetaLine {
+            meta: session_meta,
+            git: git_info,
+        };
+
+        let rollout_item = RolloutItem::SessionMeta(session_meta_line);
+        super::postgres::append_rollout_items(
+            &pool,
+            conversation_id,
+            std::slice::from_ref(&rollout_item),
+        )
+        .await?;
+    }
+
+    while let Some(cmd) = rx.recv().await {
+        match cmd {
+            RolloutCmd::AddItems(items) => {
+                let persisted_items = items
+                    .into_iter()
+                    .filter(is_persisted_response_item)
+                    .collect::<Vec<_>>();
+                if persisted_items.is_empty() {
+                    continue;
+                }
+                super::postgres::append_rollout_items(&pool, conversation_id, &persisted_items)
+                    .await?;
+            }
+            RolloutCmd::Flush { ack } => {
+                let _ = ack.send(());
+            }
+            RolloutCmd::Shutdown { ack } => {
+                let _ = ack.send(());
+            }
+        }
+    }
+
+    Ok(())
 }
 
 #[allow(clippy::too_many_arguments)]

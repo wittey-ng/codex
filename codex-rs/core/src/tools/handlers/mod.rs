@@ -1,6 +1,8 @@
 pub mod apply_patch;
 pub(crate) mod collab;
 mod dynamic;
+mod generate_image;
+mod generate_video;
 mod grep_files;
 mod list_dir;
 mod mcp;
@@ -17,6 +19,7 @@ mod view_image;
 pub use plan::PLAN_TOOL;
 use serde::Deserialize;
 
+use crate::auth::AuthMode;
 use crate::auth::read_openai_api_key_from_env;
 use crate::codex::TurnContext;
 use crate::config::Config;
@@ -24,9 +27,10 @@ use crate::function_tool::FunctionCallError;
 use crate::model_provider_info::ModelProviderInfo;
 pub use apply_patch::ApplyPatchHandler;
 use codex_api::Provider as ApiProvider;
-use codex_app_server_protocol::AuthMode;
 pub use collab::CollabHandler;
 pub use dynamic::DynamicToolHandler;
+pub use generate_image::GenerateImageHandler;
+pub use generate_video::GenerateVideoHandler;
 pub use grep_files::GrepFilesHandler;
 pub use list_dir::ListDirHandler;
 pub use mcp::McpHandler;
@@ -83,7 +87,7 @@ async fn resolve_openai_api_key(
 
     if let Some(auth_manager) = turn.client.get_auth_manager()
         && let Some(auth) = auth_manager.auth().await
-        && matches!(auth.mode, AuthMode::ApiKey)
+        && matches!(auth, crate::auth::CodexAuth::ApiKey(_))
     {
         return auth
             .get_token()

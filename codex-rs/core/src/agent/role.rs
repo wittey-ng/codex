@@ -7,14 +7,17 @@ use serde::Serialize;
 
 /// Base instructions for the orchestrator role.
 const ORCHESTRATOR_PROMPT: &str = include_str!("../../templates/agents/orchestrator.md");
+/// Base instructions for the research role.
+const RESEARCH_PROMPT: &str = include_str!("../../templates/agents/research.md");
 /// Default model override used.
 // TODO(jif) update when we have something smarter.
 const EXPLORER_MODEL: &str = "gpt-5.2-codex";
 
 /// Enumerated list of all supported agent roles.
-const ALL_ROLES: [AgentRole; 4] = [
+const ALL_ROLES: [AgentRole; 5] = [
     AgentRole::Default,
     AgentRole::Orchestrator,
+    AgentRole::Research,
     AgentRole::Explorer,
     AgentRole::Worker,
     // TODO(jif) add when we have stable prompts + models
@@ -29,6 +32,8 @@ pub enum AgentRole {
     Default,
     /// Coordination-only agent that delegates to workers.
     Orchestrator,
+    /// Read-only agent for research and analysis work.
+    Research,
     /// Task-executing agent with a fixed model override.
     Worker,
     /// Explorer agent with a fixed model override.
@@ -82,6 +87,10 @@ impl AgentRole {
             AgentRole::Research => AgentProfile {
                 base_instructions: Some(RESEARCH_PROMPT),
                 read_only: true,
+                description: r#"Use for read-only research and analysis tasks.
+Rules:
+- Do not modify files.
+- Prefer gathering context, analysis, and recommendations over implementation."#,
                 ..Default::default()
             },
             AgentRole::Worker => AgentProfile {
@@ -133,7 +142,6 @@ Rules:
                 .set(SandboxPolicy::new_read_only_policy())
                 .map_err(|err| format!("sandbox_policy is invalid: {err}"))?;
         }
-        // Enable ResearchMode feature for Research role
         if self == AgentRole::Research {
             config.features.enable(Feature::ResearchMode);
         }

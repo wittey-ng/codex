@@ -11,6 +11,7 @@ pub(crate) mod error;
 pub mod list;
 pub(crate) mod metadata;
 pub(crate) mod policy;
+pub(crate) mod postgres;
 pub mod recorder;
 pub(crate) mod session_index;
 pub(crate) mod truncation;

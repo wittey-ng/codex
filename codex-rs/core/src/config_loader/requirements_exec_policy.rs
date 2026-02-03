@@ -6,6 +6,7 @@ use codex_execpolicy::rule::PrefixRule;
 use codex_execpolicy::rule::RuleRef;
 use multimap::MultiMap;
 use serde::Deserialize;
+use serde::Serialize;
 use std::sync::Arc;
 use thiserror::Error;
 
@@ -46,7 +47,7 @@ fn policy_fingerprint(policy: &Policy) -> Vec<String> {
 }
 
 /// TOML representation of `[rules]` within `requirements.toml`.
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 pub struct RequirementsExecPolicyToml {
     pub prefix_rules: Vec<RequirementsExecPolicyPrefixRuleToml>,
 }
@@ -54,7 +55,7 @@ pub struct RequirementsExecPolicyToml {
 /// A TOML representation of the `prefix_rule(...)` Starlark builtin.
 ///
 /// This mirrors the builtin defined in `execpolicy/src/parser.rs`.
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 pub struct RequirementsExecPolicyPrefixRuleToml {
     pub pattern: Vec<RequirementsExecPolicyPatternTokenToml>,
     pub decision: Option<RequirementsExecPolicyDecisionToml>,
@@ -66,13 +67,13 @@ pub struct RequirementsExecPolicyPrefixRuleToml {
 /// Starlark supports either a string token or a list of alternative tokens at
 /// each position, but TOML arrays cannot mix strings and arrays. Using an
 /// array of tables sidesteps that restriction.
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 pub struct RequirementsExecPolicyPatternTokenToml {
     pub token: Option<String>,
     pub any_of: Option<Vec<String>>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum RequirementsExecPolicyDecisionToml {
     Allow,

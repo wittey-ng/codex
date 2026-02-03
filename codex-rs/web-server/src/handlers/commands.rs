@@ -11,6 +11,7 @@ use codex_core::exec_env::create_env;
 use codex_core::get_platform_sandbox;
 use codex_core::protocol::SandboxPolicy;
 use codex_core::sandboxing::SandboxPermissions;
+use codex_protocol::config_types::WindowsSandboxLevel;
 use serde::Deserialize;
 use serde::Serialize;
 use std::collections::HashMap;
@@ -100,7 +101,7 @@ pub async fn execute_command(
                 .to_string(),
         ));
     }
-    if get_platform_sandbox() != Some(SandboxType::BoxLite) {
+    if get_platform_sandbox(false) != Some(SandboxType::BoxLite) {
         return Err(ApiError::InternalError(
             "BoxLite sandbox is required for /api/v2/commands; configure BOXLITE_RUNTIME_DIR so BoxLite can locate boxlite-guest/mke2fs/debugfs"
                 .to_string(),
@@ -115,6 +116,7 @@ pub async fn execute_command(
         expiration: ExecExpiration::Timeout(std::time::Duration::from_secs(10)),
         env,
         sandbox_permissions: SandboxPermissions::UseDefault,
+        windows_sandbox_level: WindowsSandboxLevel::Disabled,
         justification: None,
         arg0: None,
     };

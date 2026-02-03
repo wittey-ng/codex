@@ -3898,6 +3898,7 @@ model_verbosity = "high"
                 analytics_enabled: Some(true),
                 feedback_enabled: true,
                 tui_alternate_screen: AltScreenMode::Auto,
+                vector_db: VectorDbConfig::default(),
                 otel: OtelConfig::default(),
             },
             o3_profile_config
@@ -3983,6 +3984,7 @@ model_verbosity = "high"
             analytics_enabled: Some(true),
             feedback_enabled: true,
             tui_alternate_screen: AltScreenMode::Auto,
+            vector_db: VectorDbConfig::default(),
             otel: OtelConfig::default(),
         };
 
@@ -4083,6 +4085,7 @@ model_verbosity = "high"
             analytics_enabled: Some(false),
             feedback_enabled: true,
             tui_alternate_screen: AltScreenMode::Auto,
+            vector_db: VectorDbConfig::default(),
             otel: OtelConfig::default(),
         };
 
@@ -4169,6 +4172,7 @@ model_verbosity = "high"
             analytics_enabled: Some(true),
             feedback_enabled: true,
             tui_alternate_screen: AltScreenMode::Auto,
+            vector_db: VectorDbConfig::default(),
             otel: OtelConfig::default(),
         };
 

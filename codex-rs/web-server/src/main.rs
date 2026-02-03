@@ -18,6 +18,7 @@ use axum::routing::put;
 use codex_core::ThreadManager;
 use codex_core::auth::AuthManager;
 use codex_core::config::service::ConfigService;
+use codex_core::config_loader::CloudRequirementsLoader;
 use codex_protocol::protocol::SessionSource;
 use serde_json::Value;
 use serde_json::json;
@@ -25,6 +26,7 @@ use std::sync::Arc;
 use tower_http::cors::Any;
 use tower_http::cors::CorsLayer;
 use utoipa::OpenApi;
+#[cfg(feature = "swagger-ui")]
 use utoipa_swagger_ui::SwaggerUi;
 use uuid::Uuid;
 
@@ -172,6 +174,7 @@ async fn main() -> anyhow::Result<()> {
         codex_home.clone(),
         vec![],
         Default::default(),
+        CloudRequirementsLoader::default(),
     ));
 
     let thread_manager = Arc::new(ThreadManager::new(
@@ -299,7 +302,6 @@ async fn main() -> anyhow::Result<()> {
 
     let app = Router::new()
         .route("/health", get(health))
-        .merge(SwaggerUi::new("/swagger-ui").url("/api-docs/openapi.json", ApiDoc::openapi()))
         .merge(protected_routes)
         .layer(
             CorsLayer::new()
@@ -314,11 +316,16 @@ async fn main() -> anyhow::Result<()> {
         )
         .with_state(web_state);
 
+    #[cfg(feature = "swagger-ui")]
+    let app =
+        app.merge(SwaggerUi::new("/swagger-ui").url("/api-docs/openapi.json", ApiDoc::openapi()));
+
     let bind_addr =
         std::env::var("CODEX_WEB_BIND_ADDR").unwrap_or_else(|_| "127.0.0.1:8080".to_string());
 
     tracing::info!("🚀 Server starting on http://{}", bind_addr);
-    tracing::info!("📚 Swagger UI: http://{}/swagger-ui", bind_addr);
+    #[cfg(feature = "swagger-ui")]
+    tracing::info!("📚 Swagger UI: http://{bind_addr}/swagger-ui");
     tracing::info!("📍 API v1 Endpoints (backward compatible):");
     tracing::info!("  GET  /health");
     tracing::info!("  POST /api/v1/threads");

@@ -1,6 +1,7 @@
 use axum::Json;
 use axum::extract::State;
 use codex_app_server_protocol::*;
+use codex_core::auth::CodexAuth;
 use codex_protocol::account::PlanType;
 use serde::Deserialize;
 use serde::Serialize;
@@ -190,9 +191,9 @@ pub async fn get_account(
 ) -> Result<Json<GetAccountResponse>, ApiError> {
     let auth = state.auth_manager.auth().await;
 
-    let account = auth.and_then(|auth| match auth.mode {
-        AuthMode::ApiKey => Some(Account::ApiKey {}),
-        AuthMode::ChatGPT => {
+    let account = auth.and_then(|auth| match auth {
+        CodexAuth::ApiKey(_) => Some(Account::ApiKey {}),
+        CodexAuth::Chatgpt(_) | CodexAuth::ChatgptAuthTokens(_) => {
             let email = auth.get_account_email()?;
             let plan_type = auth.account_plan_type().unwrap_or(PlanType::Free);
             Some(Account::Chatgpt { email, plan_type })

@@ -753,7 +753,10 @@ impl Session {
             }
             InitialHistory::Resumed(resumed_history) => (
                 resumed_history.conversation_id,
-                RolloutRecorderParams::resume(resumed_history.rollout_path.clone()),
+                RolloutRecorderParams::resume(
+                    resumed_history.conversation_id,
+                    Some(resumed_history.rollout_path.clone()),
+                ),
             ),
         };
         let state_builder = match &initial_history {
@@ -812,7 +815,7 @@ impl Session {
         })?;
         let rollout_path = rollout_recorder
             .as_ref()
-            .map(|rec| rec.rollout_path.clone());
+            .and_then(|rec| rec.rollout_path.clone());
 
         let mut post_session_configured_events = Vec::<Event>::new();
 
