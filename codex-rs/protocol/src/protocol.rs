@@ -269,6 +269,15 @@ pub enum Op {
         force_reload: bool,
     },
 
+    /// Request the list of remote skills available via ChatGPT sharing.
+    ListRemoteSkills,
+
+    /// Download a remote skill by id into the local skills cache.
+    DownloadRemoteSkill {
+        hazelnut_id: String,
+        is_preload: bool,
+    },
+
     /// Request the agent to summarize the current conversation context.
     /// The agent will use its existing context (either conversation history or previous response id)
     /// to generate a summary which will be returned as an AgentMessage event.
@@ -589,13 +598,18 @@ impl SandboxPolicy {
                             }
                             subpaths.push(top_level_git);
                         }
-                        #[allow(clippy::expect_used)]
-                        let top_level_codex = writable_root
-                            .join(".codex")
-                            .expect(".codex is a valid relative path");
-                        if top_level_codex.as_path().is_dir() {
-                            subpaths.push(top_level_codex);
+
+                        // Make .agents/skills and .codex/config.toml and
+                        // related files read-only to the agent, by default.
+                        for subdir in &[".agents", ".codex"] {
+                            #[allow(clippy::expect_used)]
+                            let top_level_codex =
+                                writable_root.join(subdir).expect("valid relative path");
+                            if top_level_codex.as_path().is_dir() {
+                                subpaths.push(top_level_codex);
+                            }
                         }
+
                         WritableRoot {
                             root: writable_root,
                             read_only_subpaths: subpaths,
@@ -817,6 +831,12 @@ pub enum EventMsg {
     /// List of skills available to the agent.
     ListSkillsResponse(ListSkillsResponseEvent),
 
+    /// List of remote skills available to the agent.
+    ListRemoteSkillsResponse(ListRemoteSkillsResponseEvent),
+
+    /// Remote skill downloaded to local cache.
+    RemoteSkillDownloaded(RemoteSkillDownloadedEvent),
+
     /// Notification that skill data may have been updated and clients may want to reload.
     SkillsUpdateAvailable,
 
@@ -859,6 +879,10 @@ pub enum EventMsg {
     CollabCloseBegin(CollabCloseBeginEvent),
     /// Collab interaction: close end.
     CollabCloseEnd(CollabCloseEndEvent),
+    /// Collab interaction: resume begin.
+    CollabResumeBegin(CollabResumeBeginEvent),
+    /// Collab interaction: resume end.
+    CollabResumeEnd(CollabResumeEndEvent),
 }
 
 impl From<CollabAgentSpawnBeginEvent> for EventMsg {
@@ -906,6 +930,18 @@ impl From<CollabCloseBeginEvent> for EventMsg {
 impl From<CollabCloseEndEvent> for EventMsg {
     fn from(event: CollabCloseEndEvent) -> Self {
         EventMsg::CollabCloseEnd(event)
+    }
+}
+
+impl From<CollabResumeBeginEvent> for EventMsg {
+    fn from(event: CollabResumeBeginEvent) -> Self {
+        EventMsg::CollabResumeBegin(event)
+    }
+}
+
+impl From<CollabResumeEndEvent> for EventMsg {
+    fn from(event: CollabResumeEndEvent) -> Self {
+        EventMsg::CollabResumeEnd(event)
     }
 }
 
@@ -2122,6 +2158,27 @@ pub struct ListSkillsResponseEvent {
     pub skills: Vec<SkillsListEntry>,
 }
 
+#[derive(Debug, Clone, Deserialize, Serialize, JsonSchema, TS)]
+pub struct RemoteSkillSummary {
+    pub id: String,
+    pub name: String,
+    pub description: String,
+}
+
+/// Response payload for `Op::ListRemoteSkills`.
+#[derive(Debug, Clone, Deserialize, Serialize, JsonSchema, TS)]
+pub struct ListRemoteSkillsResponseEvent {
+    pub skills: Vec<RemoteSkillSummary>,
+}
+
+/// Response payload for `Op::DownloadRemoteSkill`.
+#[derive(Debug, Clone, Deserialize, Serialize, JsonSchema, TS)]
+pub struct RemoteSkillDownloadedEvent {
+    pub id: String,
+    pub name: String,
+    pub path: PathBuf,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema, TS)]
 #[serde(rename_all = "snake_case")]
 #[ts(rename_all = "snake_case")]
@@ -2432,6 +2489,29 @@ pub struct CollabCloseEndEvent {
     pub receiver_thread_id: ThreadId,
     /// Last known status of the receiver agent reported to the sender agent before
     /// the close.
+    pub status: AgentStatus,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, JsonSchema, TS)]
+pub struct CollabResumeBeginEvent {
+    /// Identifier for the collab tool call.
+    pub call_id: String,
+    /// Thread ID of the sender.
+    pub sender_thread_id: ThreadId,
+    /// Thread ID of the receiver.
+    pub receiver_thread_id: ThreadId,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, JsonSchema, TS)]
+pub struct CollabResumeEndEvent {
+    /// Identifier for the collab tool call.
+    pub call_id: String,
+    /// Thread ID of the sender.
+    pub sender_thread_id: ThreadId,
+    /// Thread ID of the receiver.
+    pub receiver_thread_id: ThreadId,
+    /// Last known status of the receiver agent reported to the sender agent after
+    /// resume.
     pub status: AgentStatus,
 }
 
