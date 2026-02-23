@@ -878,7 +878,8 @@ async fn handle_response_item_records_tool_result_for_local_shell_missing_ids() 
         .await
         .unwrap();
 
-    wait_for_event(&codex, |ev| matches!(ev, EventMsg::TokenCount(_))).await;
+    wait_for_event(&codex, |ev| matches!(ev, EventMsg::TurnComplete(_))).await;
+    tokio::time::sleep(Duration::from_millis(50)).await;
 
     logs_assert(|lines: &[&str]| {
         let line = lines

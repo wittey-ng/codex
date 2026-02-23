@@ -105,24 +105,23 @@ pub(crate) async fn handle_output_item_done(
                 .log_tool_failed("local_shell", msg);
             tracing::error!(msg);
 
-            let response = ResponseInputItem::FunctionCallOutput {
-                call_id: String::new(),
-                output: FunctionCallOutputPayload {
-                    body: FunctionCallOutputBody::Text(msg.to_string()),
-                    ..Default::default()
-                },
-            };
             ctx.sess
                 .record_conversation_items(&ctx.turn_context, std::slice::from_ref(&item))
                 .await;
-            if let Some(response_item) = response_input_to_response_item(&response) {
-                ctx.sess
-                    .record_conversation_items(
-                        &ctx.turn_context,
-                        std::slice::from_ref(&response_item),
-                    )
-                    .await;
-            }
+            ctx.sess
+                .record_conversation_items(
+                    &ctx.turn_context,
+                    std::slice::from_ref(&ResponseItem::Message {
+                        id: None,
+                        role: "assistant".to_string(),
+                        content: vec![codex_protocol::models::ContentItem::OutputText {
+                            text: msg.to_string(),
+                        }],
+                        end_turn: None,
+                        phase: None,
+                    }),
+                )
+                .await;
 
             output.needs_follow_up = true;
         }
