@@ -1,6 +1,7 @@
 #![expect(clippy::expect_used)]
 
 use codex_utils_cargo_bin::CargoBinError;
+use ctor::ctor;
 use tempfile::TempDir;
 
 use codex_core::CodexThread;
@@ -11,11 +12,39 @@ use codex_utils_absolute_path::AbsolutePathBuf;
 use regex_lite::Regex;
 use std::path::PathBuf;
 
+pub mod apps_test_server;
+pub mod context_snapshot;
 pub mod process;
 pub mod responses;
 pub mod streaming_sse;
 pub mod test_codex;
 pub mod test_codex_exec;
+
+#[ctor]
+fn enable_deterministic_unified_exec_process_ids_for_tests() {
+    codex_core::test_support::set_thread_manager_test_mode(true);
+    codex_core::test_support::set_deterministic_process_ids(true);
+}
+
+#[ctor]
+fn configure_insta_workspace_root_for_snapshot_tests() {
+    if std::env::var_os("INSTA_WORKSPACE_ROOT").is_some() {
+        return;
+    }
+
+    let workspace_root = codex_utils_cargo_bin::repo_root()
+        .ok()
+        .map(|root| root.join("codex-rs"));
+
+    if let Some(workspace_root) = workspace_root
+        && let Ok(workspace_root) = workspace_root.canonicalize()
+    {
+        // Safety: this ctor runs at process startup before test threads begin.
+        unsafe {
+            std::env::set_var("INSTA_WORKSPACE_ROOT", workspace_root);
+        }
+    }
+}
 
 #[track_caller]
 pub fn assert_regex_match<'s>(pattern: &str, actual: &'s str) -> regex_lite::Captures<'s> {
@@ -146,9 +175,12 @@ pub fn load_sse_fixture_with_id_from_str(raw: &str, id: &str) -> String {
         .collect()
 }
 
-pub async fn wait_for_event<F>(codex: &CodexThread, predicate: F) -> codex_core::protocol::EventMsg
+pub async fn wait_for_event<F>(
+    codex: &CodexThread,
+    predicate: F,
+) -> codex_protocol::protocol::EventMsg
 where
-    F: FnMut(&codex_core::protocol::EventMsg) -> bool,
+    F: FnMut(&codex_protocol::protocol::EventMsg) -> bool,
 {
     use tokio::time::Duration;
     wait_for_event_with_timeout(codex, predicate, Duration::from_secs(1)).await
@@ -156,7 +188,7 @@ where
 
 pub async fn wait_for_event_match<T, F>(codex: &CodexThread, matcher: F) -> T
 where
-    F: Fn(&codex_core::protocol::EventMsg) -> Option<T>,
+    F: Fn(&codex_protocol::protocol::EventMsg) -> Option<T>,
 {
     let ev = wait_for_event(codex, |ev| matcher(ev).is_some()).await;
     matcher(&ev).unwrap()
@@ -166,9 +198,9 @@ pub async fn wait_for_event_with_timeout<F>(
     codex: &CodexThread,
     mut predicate: F,
     wait_time: tokio::time::Duration,
-) -> codex_core::protocol::EventMsg
+) -> codex_protocol::protocol::EventMsg
 where
-    F: FnMut(&codex_core::protocol::EventMsg) -> bool,
+    F: FnMut(&codex_protocol::protocol::EventMsg) -> bool,
 {
     use tokio::time::Duration;
     use tokio::time::timeout;

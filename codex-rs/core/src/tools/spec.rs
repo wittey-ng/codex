@@ -1,15 +1,19 @@
-use crate::agent::AgentRole;
+use crate::client_common::tools::FreeformTool;
+use crate::client_common::tools::FreeformToolFormat;
 use crate::client_common::tools::ResponsesApiTool;
 use crate::client_common::tools::ToolSpec;
-use crate::config::VectorDbConfig;
+use crate::config::AgentRoleConfig;
 use crate::features::Feature;
 use crate::features::Features;
+use crate::mcp_connection_manager::ToolInfo;
 use crate::tools::handlers::PLAN_TOOL;
+use crate::tools::handlers::SEARCH_TOOL_BM25_DEFAULT_LIMIT;
+use crate::tools::handlers::SEARCH_TOOL_BM25_TOOL_NAME;
 use crate::tools::handlers::apply_patch::create_apply_patch_freeform_tool;
 use crate::tools::handlers::apply_patch::create_apply_patch_json_tool;
-use crate::tools::handlers::collab::DEFAULT_WAIT_TIMEOUT_MS;
-use crate::tools::handlers::collab::MAX_WAIT_TIMEOUT_MS;
-use crate::tools::handlers::collab::MIN_WAIT_TIMEOUT_MS;
+use crate::tools::handlers::multi_agents::DEFAULT_WAIT_TIMEOUT_MS;
+use crate::tools::handlers::multi_agents::MAX_WAIT_TIMEOUT_MS;
+use crate::tools::handlers::multi_agents::MIN_WAIT_TIMEOUT_MS;
 use crate::tools::handlers::request_user_input_tool_description;
 use crate::tools::registry::ToolRegistryBuilder;
 use codex_protocol::config_types::WebSearchMode;
@@ -25,24 +29,28 @@ use serde_json::json;
 use std::collections::BTreeMap;
 use std::collections::HashMap;
 
+const SEARCH_TOOL_BM25_DESCRIPTION_TEMPLATE: &str =
+    include_str!("../../templates/search_tool/tool_description.md");
+
 #[derive(Debug, Clone)]
 pub(crate) struct ToolsConfig {
     pub shell_type: ConfigShellToolType,
+    pub allow_login_shell: bool,
     pub apply_patch_tool_type: Option<ApplyPatchToolType>,
     pub web_search_mode: Option<WebSearchMode>,
+    pub agent_roles: BTreeMap<String, AgentRoleConfig>,
+    pub search_tool: bool,
+    pub js_repl_enabled: bool,
+    pub js_repl_tools_only: bool,
     pub collab_tools: bool,
     pub collaboration_modes_tools: bool,
-    pub memory_tools: bool,
-    pub request_rule_enabled: bool,
     pub experimental_supported_tools: Vec<String>,
-    pub vector_db: VectorDbConfig,
 }
 
 pub(crate) struct ToolsConfigParams<'a> {
     pub(crate) model_info: &'a ModelInfo,
     pub(crate) features: &'a Features,
     pub(crate) web_search_mode: Option<WebSearchMode>,
-    pub(crate) vector_db: VectorDbConfig,
 }
 
 impl ToolsConfig {
@@ -51,17 +59,19 @@ impl ToolsConfig {
             model_info,
             features,
             web_search_mode,
-            vector_db,
         } = params;
         let include_apply_patch_tool = features.enabled(Feature::ApplyPatchFreeform);
+        let include_js_repl = features.enabled(Feature::JsRepl);
+        let include_js_repl_tools_only =
+            include_js_repl && features.enabled(Feature::JsReplToolsOnly);
         let include_collab_tools = features.enabled(Feature::Collab);
-        let research_mode = features.enabled(Feature::ResearchMode);
         let include_collaboration_modes_tools = features.enabled(Feature::CollaborationModes);
-        let include_memory_tools = features.enabled(Feature::MemoryTool);
-        let request_rule_enabled = features.enabled(Feature::RequestRule);
+        let include_search_tool = features.enabled(Feature::Apps);
 
         let shell_type = if !features.enabled(Feature::ShellTool) {
             ConfigShellToolType::Disabled
+        } else if features.enabled(Feature::ShellZshFork) {
+            ConfigShellToolType::ShellCommand
         } else if features.enabled(Feature::UnifiedExec) {
             // If ConPTY not supported (for old Windows versions), fallback on ShellCommand.
             if codex_utils_pty::conpty_supported() {
@@ -73,44 +83,41 @@ impl ToolsConfig {
             model_info.shell_type
         };
 
-        // In research mode, disable apply_patch tool
-        let apply_patch_tool_type = if research_mode {
-            None
-        } else {
-            match model_info.apply_patch_tool_type {
-                Some(ApplyPatchToolType::Freeform) => Some(ApplyPatchToolType::Freeform),
-                Some(ApplyPatchToolType::Function) => Some(ApplyPatchToolType::Function),
-                None => {
-                    if include_apply_patch_tool {
-                        Some(ApplyPatchToolType::Freeform)
-                    } else {
-                        None
-                    }
+        let apply_patch_tool_type = match model_info.apply_patch_tool_type {
+            Some(ApplyPatchToolType::Freeform) => Some(ApplyPatchToolType::Freeform),
+            Some(ApplyPatchToolType::Function) => Some(ApplyPatchToolType::Function),
+            None => {
+                if include_apply_patch_tool {
+                    Some(ApplyPatchToolType::Freeform)
+                } else {
+                    None
                 }
             }
         };
 
-        // In research mode, enable analysis tools (grep_files, read_file, list_dir)
-        let mut experimental_supported_tools = model_info.experimental_supported_tools.clone();
-        if research_mode {
-            for tool in ["grep_files", "list_dir", "read_file"] {
-                if !experimental_supported_tools.iter().any(|t| t == tool) {
-                    experimental_supported_tools.push(tool.to_string());
-                }
-            }
-        }
-
         Self {
             shell_type,
+            allow_login_shell: true,
             apply_patch_tool_type,
             web_search_mode: *web_search_mode,
+            agent_roles: BTreeMap::new(),
+            search_tool: include_search_tool,
+            js_repl_enabled: include_js_repl,
+            js_repl_tools_only: include_js_repl_tools_only,
             collab_tools: include_collab_tools,
             collaboration_modes_tools: include_collaboration_modes_tools,
-            memory_tools: include_memory_tools,
-            request_rule_enabled,
-            experimental_supported_tools,
-            vector_db: vector_db.clone(),
+            experimental_supported_tools: model_info.experimental_supported_tools.clone(),
         }
+    }
+
+    pub fn with_agent_roles(mut self, agent_roles: BTreeMap<String, AgentRoleConfig>) -> Self {
+        self.agent_roles = agent_roles;
+        self
+    }
+
+    pub fn with_allow_login_shell(mut self, allow_login_shell: bool) -> Self {
+        self.allow_login_shell = allow_login_shell;
+        self
     }
 }
 
@@ -170,7 +177,7 @@ impl From<JsonSchema> for AdditionalProperties {
     }
 }
 
-fn create_approval_parameters(include_prefix_rule: bool) -> BTreeMap<String, JsonSchema> {
+fn create_approval_parameters() -> BTreeMap<String, JsonSchema> {
     let mut properties = BTreeMap::from([
         (
             "sandbox_permissions".to_string(),
@@ -185,10 +192,10 @@ fn create_approval_parameters(include_prefix_rule: bool) -> BTreeMap<String, Jso
             "justification".to_string(),
             JsonSchema::String {
                 description: Some(
-                    r#"Only set if sandbox_permissions is \"require_escalated\". 
-                    Request approval from the user to run this command outside the sandbox. 
-                    Phrased as a simple question that summarizes the purpose of the 
-                    command as it relates to the task at hand - e.g. 'Do you want to 
+                    r#"Only set if sandbox_permissions is \"require_escalated\".
+                    Request approval from the user to run this command outside the sandbox.
+                    Phrased as a simple question that summarizes the purpose of the
+                    command as it relates to the task at hand - e.g. 'Do you want to
                     fetch and pull the latest version of this git branch?'"#
                     .to_string(),
                 ),
@@ -196,23 +203,22 @@ fn create_approval_parameters(include_prefix_rule: bool) -> BTreeMap<String, Jso
         ),
     ]);
 
-    if include_prefix_rule {
-        properties.insert(
-            "prefix_rule".to_string(),
-            JsonSchema::Array {
-                items: Box::new(JsonSchema::String { description: None }),
-                description: Some(
-                    r#"Only specify when sandbox_permissions is `require_escalated`. 
+    properties.insert(
+        "prefix_rule".to_string(),
+        JsonSchema::Array {
+            items: Box::new(JsonSchema::String { description: None }),
+            description: Some(
+                r#"Only specify when sandbox_permissions is `require_escalated`.
                     Suggest a prefix command pattern that will allow you to fulfill similar requests from the user in the future.
                     Should be a short but reasonable prefix, e.g. [\"git\", \"pull\"] or [\"uv\", \"run\"] or [\"pytest\"]."#.to_string(),
-                ),
-            });
-    }
+            ),
+        },
+    );
 
     properties
 }
 
-fn create_exec_command_tool(include_prefix_rule: bool) -> ToolSpec {
+fn create_exec_command_tool(allow_login_shell: bool) -> ToolSpec {
     let mut properties = BTreeMap::from([
         (
             "cmd".to_string(),
@@ -233,14 +239,6 @@ fn create_exec_command_tool(include_prefix_rule: bool) -> ToolSpec {
             "shell".to_string(),
             JsonSchema::String {
                 description: Some("Shell binary to launch. Defaults to the user's default shell.".to_string()),
-            },
-        ),
-        (
-            "login".to_string(),
-            JsonSchema::Boolean {
-                description: Some(
-                    "Whether to run the shell with -l/-i semantics. Defaults to true.".to_string(),
-                ),
             },
         ),
         (
@@ -270,7 +268,17 @@ fn create_exec_command_tool(include_prefix_rule: bool) -> ToolSpec {
             },
         ),
     ]);
-    properties.extend(create_approval_parameters(include_prefix_rule));
+    if allow_login_shell {
+        properties.insert(
+            "login".to_string(),
+            JsonSchema::Boolean {
+                description: Some(
+                    "Whether to run the shell with -l/-i semantics. Defaults to true.".to_string(),
+                ),
+            },
+        );
+    }
+    properties.extend(create_approval_parameters());
 
     ToolSpec::Function(ResponsesApiTool {
         name: "exec_command".to_string(),
@@ -333,7 +341,7 @@ fn create_write_stdin_tool() -> ToolSpec {
     })
 }
 
-fn create_shell_tool(include_prefix_rule: bool) -> ToolSpec {
+fn create_shell_tool() -> ToolSpec {
     let mut properties = BTreeMap::from([
         (
             "command".to_string(),
@@ -355,11 +363,11 @@ fn create_shell_tool(include_prefix_rule: bool) -> ToolSpec {
             },
         ),
     ]);
-    properties.extend(create_approval_parameters(include_prefix_rule));
+    properties.extend(create_approval_parameters());
 
     let description  = if cfg!(windows) {
         r#"Runs a Powershell command (Windows) and returns its output. Arguments to `shell` will be passed to CreateProcessW(). Most commands should be prefixed with ["powershell.exe", "-Command"].
-        
+
 Examples of valid command strings:
 
 - ls -a (show hidden): ["powershell.exe", "-Command", "Get-ChildItem -Force"]
@@ -386,7 +394,7 @@ Examples of valid command strings:
     })
 }
 
-fn create_shell_command_tool(include_prefix_rule: bool) -> ToolSpec {
+fn create_shell_command_tool(allow_login_shell: bool) -> ToolSpec {
     let mut properties = BTreeMap::from([
         (
             "command".to_string(),
@@ -403,6 +411,14 @@ fn create_shell_command_tool(include_prefix_rule: bool) -> ToolSpec {
             },
         ),
         (
+            "timeout_ms".to_string(),
+            JsonSchema::Number {
+                description: Some("The timeout for the command in milliseconds".to_string()),
+            },
+        ),
+    ]);
+    if allow_login_shell {
+        properties.insert(
             "login".to_string(),
             JsonSchema::Boolean {
                 description: Some(
@@ -410,19 +426,13 @@ fn create_shell_command_tool(include_prefix_rule: bool) -> ToolSpec {
                         .to_string(),
                 ),
             },
-        ),
-        (
-            "timeout_ms".to_string(),
-            JsonSchema::Number {
-                description: Some("The timeout for the command in milliseconds".to_string()),
-            },
-        ),
-    ]);
-    properties.extend(create_approval_parameters(include_prefix_rule));
+        );
+    }
+    properties.extend(create_approval_parameters());
 
     let description = if cfg!(windows) {
         r#"Runs a Powershell command (Windows) and returns its output.
-        
+
 Examples of valid command strings:
 
 - ls -a (show hidden): "Get-ChildItem -Force"
@@ -470,167 +480,79 @@ fn create_view_image_tool() -> ToolSpec {
     })
 }
 
-fn create_query_vector_db_tool() -> ToolSpec {
-    let mut properties = BTreeMap::new();
-    properties.insert(
-        "query".to_string(),
-        JsonSchema::String {
-            description: Some("Natural language query to search for in the vector database (e.g., 'iPhone 16 battery complaints', 'positive reviews about camera quality')".to_string()),
-        },
-    );
-    properties.insert(
-        "platform".to_string(),
-        JsonSchema::String {
-            description: Some("Filter by platform: xhs (Xiaohongshu), dy (Douyin), ks (Kuaishou), bili (Bilibili), wb (Weibo)".to_string()),
-        },
-    );
-    properties.insert(
-        "doc_type".to_string(),
-        JsonSchema::String {
-            description: Some(
-                "Filter by document type: customer_demand, pain_point, sentiment, product_mention"
-                    .to_string(),
-            ),
-        },
-    );
-    properties.insert(
-        "limit".to_string(),
-        JsonSchema::Number {
-            description: Some("Maximum number of results to return (default: 10)".to_string()),
-        },
-    );
-    properties.insert(
-        "min_likes".to_string(),
-        JsonSchema::Number {
-            description: Some("Minimum likes/engagement threshold".to_string()),
-        },
-    );
-    properties.insert(
-        "sentiment".to_string(),
-        JsonSchema::String {
-            description: Some("Filter by sentiment: positive, negative, neutral".to_string()),
-        },
-    );
+fn create_collab_input_items_schema() -> JsonSchema {
+    let properties = BTreeMap::from([
+        (
+            "type".to_string(),
+            JsonSchema::String {
+                description: Some(
+                    "Input item type: text, image, local_image, skill, or mention.".to_string(),
+                ),
+            },
+        ),
+        (
+            "text".to_string(),
+            JsonSchema::String {
+                description: Some("Text content when type is text.".to_string()),
+            },
+        ),
+        (
+            "image_url".to_string(),
+            JsonSchema::String {
+                description: Some("Image URL when type is image.".to_string()),
+            },
+        ),
+        (
+            "path".to_string(),
+            JsonSchema::String {
+                description: Some(
+                    "Path when type is local_image/skill, or mention target such as app://<connector-id> when type is mention."
+                        .to_string(),
+                ),
+            },
+        ),
+        (
+            "name".to_string(),
+            JsonSchema::String {
+                description: Some("Display name when type is skill or mention.".to_string()),
+            },
+        ),
+    ]);
 
-    ToolSpec::Function(ResponsesApiTool {
-        name: "query_vector_db".to_string(),
-        description: "Search the e-commerce insights vector database for customer demands, pain points, sentiment analysis, and product mentions from social media platforms. Use this to analyze market trends, customer feedback, and product perception.".to_string(),
-        strict: false,
-        parameters: JsonSchema::Object {
+    JsonSchema::Array {
+        items: Box::new(JsonSchema::Object {
             properties,
-            required: Some(vec!["query".to_string()]),
+            required: None,
             additional_properties: Some(false.into()),
-        },
-    })
+        }),
+        description: Some(
+            "Structured input items. Use this to pass explicit mentions (for example app:// connector paths)."
+                .to_string(),
+        ),
+    }
 }
 
-fn create_generate_image_tool() -> ToolSpec {
-    let mut properties = BTreeMap::new();
-    properties.insert(
-        "prompt".to_string(),
-        JsonSchema::String {
-            description: Some("Detailed description of the image to generate (e.g., 'A professional product photo of iPhone 16 with clean white background, highlighting the improved battery life')".to_string()),
-        },
-    );
-    properties.insert(
-        "size".to_string(),
-        JsonSchema::String {
-            description: Some(
-                "Image size: 1024x1024 (default), 1792x1024, or 1024x1792".to_string(),
-            ),
-        },
-    );
-    properties.insert(
-        "quality".to_string(),
-        JsonSchema::String {
-            description: Some("Image quality: standard (default) or hd".to_string()),
-        },
-    );
-    properties.insert(
-        "n".to_string(),
-        JsonSchema::Number {
-            description: Some("Number of images to generate (1-4, default: 1)".to_string()),
-        },
-    );
-
-    ToolSpec::Function(ResponsesApiTool {
-        name: "generate_image".to_string(),
-        description: "Generate high-quality images using DALL-E 3 for e-commerce marketing, product visualization, or content creation. The generated images are returned as base64-encoded content.".to_string(),
-        strict: false,
-        parameters: JsonSchema::Object {
-            properties,
-            required: Some(vec!["prompt".to_string()]),
-            additional_properties: Some(false.into()),
-        },
-    })
-}
-
-fn create_generate_video_tool() -> ToolSpec {
-    let mut properties = BTreeMap::new();
-    properties.insert(
-        "prompt".to_string(),
-        JsonSchema::String {
-            description: Some("Detailed description of the video to generate (e.g., 'A 5-second product demo showing iPhone 16 rotating on a clean background with smooth lighting')".to_string()),
-        },
-    );
-    properties.insert(
-        "model".to_string(),
-        JsonSchema::String {
-            description: Some(
-                "Video model (default: sora-2; allowed: sora-2, sora-2-pro). Larger resolutions require sora-2-pro.".to_string(),
-            ),
-        },
-    );
-    properties.insert(
-        "duration".to_string(),
-        JsonSchema::Number {
-            description: Some(
-                "Video duration in seconds (default: 4; allowed: 4, 8, 12)".to_string(),
-            ),
-        },
-    );
-    properties.insert(
-        "resolution".to_string(),
-        JsonSchema::String {
-            description: Some(
-                "Video resolution (default: 720x1280; allowed: 720x1280, 1280x720, 1024x1792, 1792x1024; larger sizes require sora-2-pro)"
-                    .to_string(),
-            ),
-        },
-    );
-
-    ToolSpec::Function(ResponsesApiTool {
-        name: "generate_video".to_string(),
-        description: "Generate short-form video content using OpenAI Sora for e-commerce marketing, product demonstrations, or social media content.".to_string(),
-        strict: false,
-        parameters: JsonSchema::Object {
-            properties,
-            required: Some(vec!["prompt".to_string()]),
-            additional_properties: Some(false.into()),
-        },
-    })
-}
-
-fn create_spawn_agent_tool() -> ToolSpec {
-    let mut properties = BTreeMap::new();
-    properties.insert(
-        "message".to_string(),
-        JsonSchema::String {
-            description: Some(
-                "Initial task for the new agent. Include scope, constraints, and the expected output."
-                    .to_string(),
-            ),
-        },
-    );
-    properties.insert(
-        "agent_type".to_string(),
-        JsonSchema::String {
-            description: Some(format!(
-                "Optional agent type ({}). Use an explicit type when delegating.",
-                AgentRole::enum_values().join(", ")
-            )),
-        },
-    );
+fn create_spawn_agent_tool(config: &ToolsConfig) -> ToolSpec {
+    let properties = BTreeMap::from([
+        (
+            "message".to_string(),
+            JsonSchema::String {
+                description: Some(
+                    "Initial plain-text task for the new agent. Use either message or items."
+                        .to_string(),
+                ),
+            },
+        ),
+        ("items".to_string(), create_collab_input_items_schema()),
+        (
+            "agent_type".to_string(),
+            JsonSchema::String {
+                description: Some(crate::agent::role::spawn_tool_spec::build(
+                    &config.agent_roles,
+                )),
+            },
+        ),
+    ]);
 
     ToolSpec::Function(ResponsesApiTool {
         name: "spawn_agent".to_string(),
@@ -640,35 +562,40 @@ fn create_spawn_agent_tool() -> ToolSpec {
         strict: false,
         parameters: JsonSchema::Object {
             properties,
-            required: Some(vec!["message".to_string()]),
+            required: None,
             additional_properties: Some(false.into()),
         },
     })
 }
 
 fn create_send_input_tool() -> ToolSpec {
-    let mut properties = BTreeMap::new();
-    properties.insert(
-        "id".to_string(),
-        JsonSchema::String {
-            description: Some("Agent id to message (from spawn_agent).".to_string()),
-        },
-    );
-    properties.insert(
-        "message".to_string(),
-        JsonSchema::String {
-            description: Some("Message to send to the agent.".to_string()),
-        },
-    );
-    properties.insert(
-        "interrupt".to_string(),
-        JsonSchema::Boolean {
-            description: Some(
-                "When true, stop the agent's current task and handle this immediately. When false (default), queue this message."
-                    .to_string(),
-            ),
-        },
-    );
+    let properties = BTreeMap::from([
+        (
+            "id".to_string(),
+            JsonSchema::String {
+                description: Some("Agent id to message (from spawn_agent).".to_string()),
+            },
+        ),
+        (
+            "message".to_string(),
+            JsonSchema::String {
+                description: Some(
+                    "Legacy plain-text message to send to the agent. Use either message or items."
+                        .to_string(),
+                ),
+            },
+        ),
+        ("items".to_string(), create_collab_input_items_schema()),
+        (
+            "interrupt".to_string(),
+            JsonSchema::Boolean {
+                description: Some(
+                    "When true, stop the agent's current task and handle this immediately. When false (default), queue this message."
+                        .to_string(),
+                ),
+            },
+        ),
+    ]);
 
     ToolSpec::Function(ResponsesApiTool {
         name: "send_input".to_string(),
@@ -678,7 +605,7 @@ fn create_send_input_tool() -> ToolSpec {
         strict: false,
         parameters: JsonSchema::Object {
             properties,
-            required: Some(vec!["id".to_string(), "message".to_string()]),
+            required: Some(vec!["id".to_string()]),
             additional_properties: Some(false.into()),
         },
     })
@@ -730,7 +657,7 @@ fn create_wait_tool() -> ToolSpec {
 
     ToolSpec::Function(ResponsesApiTool {
         name: "wait".to_string(),
-        description: "Wait for agents to reach a final status. Completed statuses may include the agent's final message. Returns empty status when timed out."
+        description: "Wait for agents to reach a final status. Completed statuses may include the agent's final message. Returns empty status when timed out. Once the agent reaches his final status, a notification message will be received containing the same completed status."
             .to_string(),
         strict: false,
         parameters: JsonSchema::Object {
@@ -817,28 +744,6 @@ fn create_request_user_input_tool() -> ToolSpec {
         parameters: JsonSchema::Object {
             properties,
             required: Some(vec!["questions".to_string()]),
-            additional_properties: Some(false.into()),
-        },
-    })
-}
-
-fn create_get_memory_tool() -> ToolSpec {
-    let properties = BTreeMap::from([(
-        "memory_id".to_string(),
-        JsonSchema::String {
-            description: Some(
-                "Memory ID to fetch. Uses the thread ID as the memory identifier.".to_string(),
-            ),
-        },
-    )]);
-
-    ToolSpec::Function(ResponsesApiTool {
-        name: "get_memory".to_string(),
-        description: "Loads the full stored memory payload for a memory_id.".to_string(),
-        strict: false,
-        parameters: JsonSchema::Object {
-            properties,
-            required: Some(vec!["memory_id".to_string()]),
             additional_properties: Some(false.into()),
         },
     })
@@ -979,6 +884,46 @@ fn create_grep_files_tool() -> ToolSpec {
         parameters: JsonSchema::Object {
             properties,
             required: Some(vec!["pattern".to_string()]),
+            additional_properties: Some(false.into()),
+        },
+    })
+}
+
+fn create_search_tool_bm25_tool(app_tools: &HashMap<String, ToolInfo>) -> ToolSpec {
+    let properties = BTreeMap::from([
+        (
+            "query".to_string(),
+            JsonSchema::String {
+                description: Some("Search query for apps tools.".to_string()),
+            },
+        ),
+        (
+            "limit".to_string(),
+            JsonSchema::Number {
+                description: Some(format!(
+                    "Maximum number of tools to return (defaults to {SEARCH_TOOL_BM25_DEFAULT_LIMIT})."
+                )),
+            },
+        ),
+    ]);
+    let mut app_names = app_tools
+        .values()
+        .filter_map(|tool| tool.connector_name.clone())
+        .collect::<Vec<_>>();
+    app_names.sort();
+    app_names.dedup();
+    let app_names = app_names.join(", ");
+
+    let description =
+        SEARCH_TOOL_BM25_DESCRIPTION_TEMPLATE.replace("{{app_names}}", app_names.as_str());
+
+    ToolSpec::Function(ResponsesApiTool {
+        name: SEARCH_TOOL_BM25_TOOL_NAME.to_string(),
+        description,
+        strict: false,
+        parameters: JsonSchema::Object {
+            properties,
+            required: Some(vec!["query".to_string()]),
             additional_properties: Some(false.into()),
         },
     })
@@ -1133,6 +1078,53 @@ fn create_list_dir_tool() -> ToolSpec {
     })
 }
 
+fn create_js_repl_tool() -> ToolSpec {
+    // Keep JS input freeform, but block the most common malformed payload shapes
+    // (JSON wrappers, quoted strings, and markdown fences) before they reach the
+    // runtime `reject_json_or_quoted_source` validation. The API's regex engine
+    // does not support look-around, so this uses a "first significant token"
+    // pattern rather than negative lookaheads.
+    const JS_REPL_FREEFORM_GRAMMAR: &str = r#"
+start: pragma_source | plain_source
+
+pragma_source: PRAGMA_LINE NEWLINE js_source
+plain_source: PLAIN_JS_SOURCE
+
+js_source: JS_SOURCE
+
+PRAGMA_LINE: /[ \t]*\/\/ codex-js-repl:[^\r\n]*/
+NEWLINE: /\r?\n/
+PLAIN_JS_SOURCE: /(?:\s*)(?:[^\s{\"`]|`[^`]|``[^`])[\s\S]*/
+JS_SOURCE: /(?:\s*)(?:[^\s{\"`]|`[^`]|``[^`])[\s\S]*/
+"#;
+
+    ToolSpec::Freeform(FreeformTool {
+        name: "js_repl".to_string(),
+        description: "Runs JavaScript in a persistent Node kernel with top-level await. This is a freeform tool: send raw JavaScript source text, optionally with a first-line pragma like `// codex-js-repl: timeout_ms=15000`; do not send JSON/quotes/markdown fences."
+            .to_string(),
+        format: FreeformToolFormat {
+            r#type: "grammar".to_string(),
+            syntax: "lark".to_string(),
+            definition: JS_REPL_FREEFORM_GRAMMAR.to_string(),
+        },
+    })
+}
+
+fn create_js_repl_reset_tool() -> ToolSpec {
+    ToolSpec::Function(ResponsesApiTool {
+        name: "js_repl_reset".to_string(),
+        description:
+            "Restarts the js_repl kernel for this run and clears persisted top-level bindings."
+                .to_string(),
+        strict: false,
+        parameters: JsonSchema::Object {
+            properties: BTreeMap::new(),
+            required: None,
+            additional_properties: Some(false.into()),
+        },
+    })
+}
+
 fn create_list_mcp_resources_tool() -> ToolSpec {
     let properties = BTreeMap::from([
         (
@@ -1236,6 +1228,7 @@ fn create_read_mcp_resource_tool() -> ToolSpec {
         },
     })
 }
+
 /// TODO(dylan): deprecate once we get rid of json tool
 #[derive(Serialize, Deserialize)]
 pub(crate) struct ApplyPatchToolArgs {
@@ -1433,22 +1426,22 @@ fn sanitize_json_schema(value: &mut JsonValue) {
 pub(crate) fn build_specs(
     config: &ToolsConfig,
     mcp_tools: Option<HashMap<String, rmcp::model::Tool>>,
+    app_tools: Option<HashMap<String, ToolInfo>>,
     dynamic_tools: &[DynamicToolSpec],
 ) -> ToolRegistryBuilder {
     use crate::tools::handlers::ApplyPatchHandler;
-    use crate::tools::handlers::CollabHandler;
     use crate::tools::handlers::DynamicToolHandler;
-    use crate::tools::handlers::GenerateImageHandler;
-    use crate::tools::handlers::GenerateVideoHandler;
-    use crate::tools::handlers::GetMemoryHandler;
     use crate::tools::handlers::GrepFilesHandler;
+    use crate::tools::handlers::JsReplHandler;
+    use crate::tools::handlers::JsReplResetHandler;
     use crate::tools::handlers::ListDirHandler;
     use crate::tools::handlers::McpHandler;
     use crate::tools::handlers::McpResourceHandler;
+    use crate::tools::handlers::MultiAgentHandler;
     use crate::tools::handlers::PlanHandler;
-    use crate::tools::handlers::QueryVectorDbHandler;
     use crate::tools::handlers::ReadFileHandler;
     use crate::tools::handlers::RequestUserInputHandler;
+    use crate::tools::handlers::SearchToolBm25Handler;
     use crate::tools::handlers::ShellCommandHandler;
     use crate::tools::handlers::ShellHandler;
     use crate::tools::handlers::TestSyncHandler;
@@ -1463,29 +1456,25 @@ pub(crate) fn build_specs(
     let plan_handler = Arc::new(PlanHandler);
     let apply_patch_handler = Arc::new(ApplyPatchHandler);
     let dynamic_tool_handler = Arc::new(DynamicToolHandler);
-    let get_memory_handler = Arc::new(GetMemoryHandler);
     let view_image_handler = Arc::new(ViewImageHandler);
-    let query_vector_db_handler = Arc::new(QueryVectorDbHandler::new(config.vector_db.clone()));
-    let generate_image_handler = Arc::new(GenerateImageHandler);
-    let generate_video_handler = Arc::new(GenerateVideoHandler);
     let mcp_handler = Arc::new(McpHandler);
     let mcp_resource_handler = Arc::new(McpResourceHandler);
     let shell_command_handler = Arc::new(ShellCommandHandler);
     let request_user_input_handler = Arc::new(RequestUserInputHandler);
+    let search_tool_handler = Arc::new(SearchToolBm25Handler);
+    let js_repl_handler = Arc::new(JsReplHandler);
+    let js_repl_reset_handler = Arc::new(JsReplResetHandler);
 
     match &config.shell_type {
         ConfigShellToolType::Default => {
-            builder.push_spec_with_parallel_support(
-                create_shell_tool(config.request_rule_enabled),
-                true,
-            );
+            builder.push_spec_with_parallel_support(create_shell_tool(), true);
         }
         ConfigShellToolType::Local => {
             builder.push_spec_with_parallel_support(ToolSpec::LocalShell {}, true);
         }
         ConfigShellToolType::UnifiedExec => {
             builder.push_spec_with_parallel_support(
-                create_exec_command_tool(config.request_rule_enabled),
+                create_exec_command_tool(config.allow_login_shell),
                 true,
             );
             builder.push_spec(create_write_stdin_tool());
@@ -1497,7 +1486,7 @@ pub(crate) fn build_specs(
         }
         ConfigShellToolType::ShellCommand => {
             builder.push_spec_with_parallel_support(
-                create_shell_command_tool(config.request_rule_enabled),
+                create_shell_command_tool(config.allow_login_shell),
                 true,
             );
         }
@@ -1511,24 +1500,35 @@ pub(crate) fn build_specs(
         builder.register_handler("shell_command", shell_command_handler);
     }
 
-    builder.push_spec_with_parallel_support(create_list_mcp_resources_tool(), true);
-    builder.push_spec_with_parallel_support(create_list_mcp_resource_templates_tool(), true);
-    builder.push_spec_with_parallel_support(create_read_mcp_resource_tool(), true);
-    builder.register_handler("list_mcp_resources", mcp_resource_handler.clone());
-    builder.register_handler("list_mcp_resource_templates", mcp_resource_handler.clone());
-    builder.register_handler("read_mcp_resource", mcp_resource_handler);
+    if mcp_tools.is_some() {
+        builder.push_spec_with_parallel_support(create_list_mcp_resources_tool(), true);
+        builder.push_spec_with_parallel_support(create_list_mcp_resource_templates_tool(), true);
+        builder.push_spec_with_parallel_support(create_read_mcp_resource_tool(), true);
+        builder.register_handler("list_mcp_resources", mcp_resource_handler.clone());
+        builder.register_handler("list_mcp_resource_templates", mcp_resource_handler.clone());
+        builder.register_handler("read_mcp_resource", mcp_resource_handler);
+    }
 
     builder.push_spec(PLAN_TOOL.clone());
     builder.register_handler("update_plan", plan_handler);
+
+    if config.js_repl_enabled {
+        builder.push_spec(create_js_repl_tool());
+        builder.push_spec(create_js_repl_reset_tool());
+        builder.register_handler("js_repl", js_repl_handler);
+        builder.register_handler("js_repl_reset", js_repl_reset_handler);
+    }
 
     if config.collaboration_modes_tools {
         builder.push_spec(create_request_user_input_tool());
         builder.register_handler("request_user_input", request_user_input_handler);
     }
 
-    if config.memory_tools {
-        builder.push_spec(create_get_memory_tool());
-        builder.register_handler("get_memory", get_memory_handler);
+    if config.search_tool
+        && let Some(app_tools) = app_tools
+    {
+        builder.push_spec_with_parallel_support(create_search_tool_bm25_tool(&app_tools), true);
+        builder.register_handler(SEARCH_TOOL_BM25_TOOL_NAME, search_tool_handler);
     }
 
     if let Some(apply_patch_tool_type) = &config.apply_patch_tool_type {
@@ -1597,27 +1597,18 @@ pub(crate) fn build_specs(
     builder.push_spec_with_parallel_support(create_view_image_tool(), true);
     builder.register_handler("view_image", view_image_handler);
 
-    builder.push_spec_with_parallel_support(create_query_vector_db_tool(), true);
-    builder.register_handler("query_vector_db", query_vector_db_handler);
-
-    builder.push_spec_with_parallel_support(create_generate_image_tool(), true);
-    builder.register_handler("generate_image", generate_image_handler);
-
-    builder.push_spec_with_parallel_support(create_generate_video_tool(), true);
-    builder.register_handler("generate_video", generate_video_handler);
-
     if config.collab_tools {
-        let collab_handler = Arc::new(CollabHandler);
-        builder.push_spec(create_spawn_agent_tool());
+        let multi_agent_handler = Arc::new(MultiAgentHandler);
+        builder.push_spec(create_spawn_agent_tool(config));
         builder.push_spec(create_send_input_tool());
         builder.push_spec(create_resume_agent_tool());
         builder.push_spec(create_wait_tool());
         builder.push_spec(create_close_agent_tool());
-        builder.register_handler("spawn_agent", collab_handler.clone());
-        builder.register_handler("send_input", collab_handler.clone());
-        builder.register_handler("resume_agent", collab_handler.clone());
-        builder.register_handler("wait", collab_handler.clone());
-        builder.register_handler("close_agent", collab_handler);
+        builder.register_handler("spawn_agent", multi_agent_handler.clone());
+        builder.register_handler("send_input", multi_agent_handler.clone());
+        builder.register_handler("resume_agent", multi_agent_handler.clone());
+        builder.register_handler("wait", multi_agent_handler.clone());
+        builder.register_handler("close_agent", multi_agent_handler);
     }
 
     if let Some(mcp_tools) = mcp_tools {
@@ -1662,7 +1653,10 @@ mod tests {
     use crate::client_common::tools::FreeformTool;
     use crate::config::test_config;
     use crate::models_manager::manager::ModelsManager;
+    use crate::models_manager::model_info::with_config_overrides;
     use crate::tools::registry::ConfiguredToolSpec;
+    use codex_protocol::openai_models::ModelInfo;
+    use codex_protocol::openai_models::ModelsResponse;
     use pretty_assertions::assert_eq;
 
     use super::*;
@@ -1679,6 +1673,7 @@ mod tests {
             input_schema: std::sync::Arc::new(rmcp::model::object(input_schema)),
             output_schema: None,
             annotations: None,
+            execution: None,
             icons: None,
             meta: None,
         }
@@ -1696,6 +1691,7 @@ mod tests {
             input_schema: std::sync::Arc::new(schema),
             output_schema: None,
             annotations: None,
+            execution: None,
             icons: None,
             meta: None,
         };
@@ -1793,10 +1789,21 @@ mod tests {
         }
     }
 
+    fn model_info_from_models_json(slug: &str) -> ModelInfo {
+        let config = test_config();
+        let response: ModelsResponse =
+            serde_json::from_str(include_str!("../../models.json")).expect("valid models.json");
+        let model = response
+            .models
+            .into_iter()
+            .find(|candidate| candidate.slug == slug)
+            .unwrap_or_else(|| panic!("model slug {slug} is missing from models.json"));
+        with_config_overrides(model, &config)
+    }
+
     #[test]
     fn test_full_toolset_specs_for_gpt5_codex_unified_exec_web_search() {
-        let config = test_config();
-        let model_info = ModelsManager::construct_model_info_offline("gpt-5-codex", &config);
+        let model_info = model_info_from_models_json("gpt-5-codex");
         let mut features = Features::with_defaults();
         features.enable(Feature::UnifiedExec);
         features.enable(Feature::CollaborationModes);
@@ -1804,9 +1811,8 @@ mod tests {
             model_info: &model_info,
             features: &features,
             web_search_mode: Some(WebSearchMode::Live),
-            vector_db: config.vector_db,
         });
-        let (tools, _) = build_specs(&config, None, &[]).build();
+        let (tools, _) = build_specs(&config, None, None, &[]).build();
 
         // Build actual map name -> spec
         use std::collections::BTreeMap;
@@ -1829,9 +1835,6 @@ mod tests {
         for spec in [
             create_exec_command_tool(true),
             create_write_stdin_tool(),
-            create_list_mcp_resources_tool(),
-            create_list_mcp_resource_templates_tool(),
-            create_read_mcp_resource_tool(),
             PLAN_TOOL.clone(),
             create_request_user_input_tool(),
             create_apply_patch_freeform_tool(),
@@ -1839,9 +1842,6 @@ mod tests {
                 external_web_access: Some(true),
             },
             create_view_image_tool(),
-            create_query_vector_db_tool(),
-            create_generate_image_tool(),
-            create_generate_video_tool(),
         ] {
             expected.insert(tool_name(&spec).to_string(), spec);
         }
@@ -1864,7 +1864,8 @@ mod tests {
     #[test]
     fn test_build_specs_collab_tools_enabled() {
         let config = test_config();
-        let model_info = ModelsManager::construct_model_info_offline("gpt-5-codex", &config);
+        let model_info =
+            ModelsManager::construct_model_info_offline_for_tests("gpt-5-codex", &config);
         let mut features = Features::with_defaults();
         features.enable(Feature::Collab);
         features.enable(Feature::CollaborationModes);
@@ -1872,9 +1873,8 @@ mod tests {
             model_info: &model_info,
             features: &features,
             web_search_mode: Some(WebSearchMode::Cached),
-            vector_db: config.vector_db,
         });
-        let (tools, _) = build_specs(&tools_config, None, &[]).build();
+        let (tools, _) = build_specs(&tools_config, None, None, &[]).build();
         assert_contains_tool_names(
             &tools,
             &[
@@ -1890,16 +1890,16 @@ mod tests {
     #[test]
     fn request_user_input_requires_collaboration_modes_feature() {
         let config = test_config();
-        let model_info = ModelsManager::construct_model_info_offline("gpt-5-codex", &config);
+        let model_info =
+            ModelsManager::construct_model_info_offline_for_tests("gpt-5-codex", &config);
         let mut features = Features::with_defaults();
         features.disable(Feature::CollaborationModes);
         let tools_config = ToolsConfig::new(&ToolsConfigParams {
             model_info: &model_info,
             features: &features,
             web_search_mode: Some(WebSearchMode::Cached),
-            vector_db: VectorDbConfig::default(),
         });
-        let (tools, _) = build_specs(&tools_config, None, &[]).build();
+        let (tools, _) = build_specs(&tools_config, None, None, &[]).build();
         assert!(
             !tools.iter().any(|t| t.spec.name() == "request_user_input"),
             "request_user_input should be disabled when collaboration_modes feature is off"
@@ -1910,37 +1910,65 @@ mod tests {
             model_info: &model_info,
             features: &features,
             web_search_mode: Some(WebSearchMode::Cached),
-            vector_db: VectorDbConfig::default(),
         });
-        let (tools, _) = build_specs(&tools_config, None, &[]).build();
+        let (tools, _) = build_specs(&tools_config, None, None, &[]).build();
         assert_contains_tool_names(&tools, &["request_user_input"]);
     }
 
     #[test]
-    fn get_memory_requires_memory_tool_feature() {
+    fn js_repl_requires_feature_flag() {
         let config = test_config();
-        let model_info = ModelsManager::construct_model_info_offline("gpt-5-codex", &config);
-        let mut features = Features::with_defaults();
-        features.disable(Feature::MemoryTool);
-        let tools_config = ToolsConfig::new(&ToolsConfigParams {
-            model_info: &model_info,
-            features: &features,
-            web_search_mode: Some(WebSearchMode::Cached),
-        });
-        let (tools, _) = build_specs(&tools_config, None, &[]).build();
-        assert!(
-            !tools.iter().any(|t| t.spec.name() == "get_memory"),
-            "get_memory should be disabled when memory_tool feature is off"
-        );
+        let model_info =
+            ModelsManager::construct_model_info_offline_for_tests("gpt-5-codex", &config);
+        let features = Features::with_defaults();
 
-        features.enable(Feature::MemoryTool);
         let tools_config = ToolsConfig::new(&ToolsConfigParams {
             model_info: &model_info,
             features: &features,
             web_search_mode: Some(WebSearchMode::Cached),
         });
-        let (tools, _) = build_specs(&tools_config, None, &[]).build();
-        assert_contains_tool_names(&tools, &["get_memory"]);
+        let (tools, _) = build_specs(&tools_config, None, None, &[]).build();
+
+        assert!(
+            !tools.iter().any(|tool| tool.spec.name() == "js_repl"),
+            "js_repl should be disabled when the feature is off"
+        );
+        assert!(
+            !tools.iter().any(|tool| tool.spec.name() == "js_repl_reset"),
+            "js_repl_reset should be disabled when the feature is off"
+        );
+    }
+
+    #[test]
+    fn js_repl_enabled_adds_tools() {
+        let config = test_config();
+        let model_info =
+            ModelsManager::construct_model_info_offline_for_tests("gpt-5-codex", &config);
+        let mut features = Features::with_defaults();
+        features.enable(Feature::JsRepl);
+
+        let tools_config = ToolsConfig::new(&ToolsConfigParams {
+            model_info: &model_info,
+            features: &features,
+            web_search_mode: Some(WebSearchMode::Cached),
+        });
+        let (tools, _) = build_specs(&tools_config, None, None, &[]).build();
+        assert_contains_tool_names(&tools, &["js_repl", "js_repl_reset"]);
+    }
+
+    #[test]
+    fn js_repl_freeform_grammar_blocks_common_non_js_prefixes() {
+        let ToolSpec::Freeform(FreeformTool { format, .. }) = create_js_repl_tool() else {
+            panic!("js_repl should use a freeform tool spec");
+        };
+
+        assert_eq!(format.syntax, "lark");
+        assert!(format.definition.contains("PRAGMA_LINE"));
+        assert!(format.definition.contains("`[^`]"));
+        assert!(format.definition.contains("``[^`]"));
+        assert!(format.definition.contains("PLAIN_JS_SOURCE"));
+        assert!(format.definition.contains("codex-js-repl:"));
+        assert!(!format.definition.contains("(?!"));
     }
 
     fn assert_model_tools(
@@ -1949,23 +1977,15 @@ mod tests {
         web_search_mode: Option<WebSearchMode>,
         expected_tools: &[&str],
     ) {
-        let config = test_config();
-        let model_info = ModelsManager::construct_model_info_offline(model_slug, &config);
+        let model_info = model_info_from_models_json(model_slug);
         let tools_config = ToolsConfig::new(&ToolsConfigParams {
             model_info: &model_info,
             features,
             web_search_mode,
-            vector_db: config.vector_db,
         });
-        let (tools, _) = build_specs(&tools_config, Some(HashMap::new()), &[]).build();
+        let (tools, _) = build_specs(&tools_config, None, None, &[]).build();
         let tool_names = tools.iter().map(|t| t.spec.name()).collect::<Vec<_>>();
-        let mut expected = expected_tools.to_vec();
-        for tool in ["query_vector_db", "generate_image", "generate_video"] {
-            if !expected.contains(&tool) {
-                expected.push(tool);
-            }
-        }
-        assert_eq!(&tool_names, &expected);
+        assert_eq!(&tool_names, &expected_tools,);
     }
 
     fn assert_default_model_tools(
@@ -1987,16 +2007,16 @@ mod tests {
     #[test]
     fn web_search_mode_cached_sets_external_web_access_false() {
         let config = test_config();
-        let model_info = ModelsManager::construct_model_info_offline("gpt-5-codex", &config);
+        let model_info =
+            ModelsManager::construct_model_info_offline_for_tests("gpt-5-codex", &config);
         let features = Features::with_defaults();
 
         let tools_config = ToolsConfig::new(&ToolsConfigParams {
             model_info: &model_info,
             features: &features,
             web_search_mode: Some(WebSearchMode::Cached),
-            vector_db: config.vector_db,
         });
-        let (tools, _) = build_specs(&tools_config, None, &[]).build();
+        let (tools, _) = build_specs(&tools_config, None, None, &[]).build();
 
         let tool = find_tool(&tools, "web_search");
         assert_eq!(
@@ -2010,16 +2030,16 @@ mod tests {
     #[test]
     fn web_search_mode_live_sets_external_web_access_true() {
         let config = test_config();
-        let model_info = ModelsManager::construct_model_info_offline("gpt-5-codex", &config);
+        let model_info =
+            ModelsManager::construct_model_info_offline_for_tests("gpt-5-codex", &config);
         let features = Features::with_defaults();
 
         let tools_config = ToolsConfig::new(&ToolsConfigParams {
             model_info: &model_info,
             features: &features,
             web_search_mode: Some(WebSearchMode::Live),
-            vector_db: config.vector_db,
         });
-        let (tools, _) = build_specs(&tools_config, None, &[]).build();
+        let (tools, _) = build_specs(&tools_config, None, None, &[]).build();
 
         let tool = find_tool(&tools, "web_search");
         assert_eq!(
@@ -2027,6 +2047,53 @@ mod tests {
             ToolSpec::WebSearch {
                 external_web_access: Some(true),
             }
+        );
+    }
+
+    #[test]
+    fn mcp_resource_tools_are_hidden_without_mcp_servers() {
+        let config = test_config();
+        let model_info =
+            ModelsManager::construct_model_info_offline_for_tests("gpt-5-codex", &config);
+        let mut features = Features::with_defaults();
+        features.enable(Feature::CollaborationModes);
+        let tools_config = ToolsConfig::new(&ToolsConfigParams {
+            model_info: &model_info,
+            features: &features,
+            web_search_mode: Some(WebSearchMode::Cached),
+        });
+        let (tools, _) = build_specs(&tools_config, None, None, &[]).build();
+
+        assert!(
+            !tools.iter().any(|tool| matches!(
+                tool.spec.name(),
+                "list_mcp_resources" | "list_mcp_resource_templates" | "read_mcp_resource"
+            )),
+            "MCP resource tools should be omitted when no MCP servers are configured"
+        );
+    }
+
+    #[test]
+    fn mcp_resource_tools_are_included_when_mcp_servers_are_present() {
+        let config = test_config();
+        let model_info =
+            ModelsManager::construct_model_info_offline_for_tests("gpt-5-codex", &config);
+        let mut features = Features::with_defaults();
+        features.enable(Feature::CollaborationModes);
+        let tools_config = ToolsConfig::new(&ToolsConfigParams {
+            model_info: &model_info,
+            features: &features,
+            web_search_mode: Some(WebSearchMode::Cached),
+        });
+        let (tools, _) = build_specs(&tools_config, Some(HashMap::new()), None, &[]).build();
+
+        assert_contains_tool_names(
+            &tools,
+            &[
+                "list_mcp_resources",
+                "list_mcp_resource_templates",
+                "read_mcp_resource",
+            ],
         );
     }
 
@@ -2040,9 +2107,6 @@ mod tests {
             Some(WebSearchMode::Cached),
             "shell_command",
             &[
-                "list_mcp_resources",
-                "list_mcp_resource_templates",
-                "read_mcp_resource",
                 "update_plan",
                 "request_user_input",
                 "apply_patch",
@@ -2062,9 +2126,6 @@ mod tests {
             Some(WebSearchMode::Cached),
             "shell_command",
             &[
-                "list_mcp_resources",
-                "list_mcp_resource_templates",
-                "read_mcp_resource",
                 "update_plan",
                 "request_user_input",
                 "apply_patch",
@@ -2086,9 +2147,6 @@ mod tests {
             &[
                 "exec_command",
                 "write_stdin",
-                "list_mcp_resources",
-                "list_mcp_resource_templates",
-                "read_mcp_resource",
                 "update_plan",
                 "request_user_input",
                 "apply_patch",
@@ -2110,9 +2168,6 @@ mod tests {
             &[
                 "exec_command",
                 "write_stdin",
-                "list_mcp_resources",
-                "list_mcp_resource_templates",
-                "read_mcp_resource",
                 "update_plan",
                 "request_user_input",
                 "apply_patch",
@@ -2123,20 +2178,18 @@ mod tests {
     }
 
     #[test]
-    fn test_codex_mini_defaults() {
+    fn test_gpt_5_1_codex_max_defaults() {
         let mut features = Features::with_defaults();
         features.enable(Feature::CollaborationModes);
         assert_default_model_tools(
-            "codex-mini-latest",
+            "gpt-5.1-codex-max",
             &features,
             Some(WebSearchMode::Cached),
-            "local_shell",
+            "shell_command",
             &[
-                "list_mcp_resources",
-                "list_mcp_resource_templates",
-                "read_mcp_resource",
                 "update_plan",
                 "request_user_input",
+                "apply_patch",
                 "web_search",
                 "view_image",
             ],
@@ -2153,9 +2206,6 @@ mod tests {
             Some(WebSearchMode::Cached),
             "shell_command",
             &[
-                "list_mcp_resources",
-                "list_mcp_resource_templates",
-                "read_mcp_resource",
                 "update_plan",
                 "request_user_input",
                 "apply_patch",
@@ -2175,9 +2225,6 @@ mod tests {
             Some(WebSearchMode::Cached),
             "shell",
             &[
-                "list_mcp_resources",
-                "list_mcp_resource_templates",
-                "read_mcp_resource",
                 "update_plan",
                 "request_user_input",
                 "web_search",
@@ -2196,9 +2243,6 @@ mod tests {
             Some(WebSearchMode::Cached),
             "shell_command",
             &[
-                "list_mcp_resources",
-                "list_mcp_resource_templates",
-                "read_mcp_resource",
                 "update_plan",
                 "request_user_input",
                 "apply_patch",
@@ -2209,45 +2253,20 @@ mod tests {
     }
 
     #[test]
-    fn test_exp_5_1_defaults() {
-        let mut features = Features::with_defaults();
-        features.enable(Feature::CollaborationModes);
-        assert_model_tools(
-            "exp-5.1",
-            &features,
-            Some(WebSearchMode::Cached),
-            &[
-                "exec_command",
-                "write_stdin",
-                "list_mcp_resources",
-                "list_mcp_resource_templates",
-                "read_mcp_resource",
-                "update_plan",
-                "request_user_input",
-                "apply_patch",
-                "web_search",
-                "view_image",
-            ],
-        );
-    }
-
-    #[test]
-    fn test_codex_mini_unified_exec_web_search() {
+    fn test_gpt_5_1_codex_max_unified_exec_web_search() {
         let mut features = Features::with_defaults();
         features.enable(Feature::UnifiedExec);
         features.enable(Feature::CollaborationModes);
         assert_model_tools(
-            "codex-mini-latest",
+            "gpt-5.1-codex-max",
             &features,
             Some(WebSearchMode::Live),
             &[
                 "exec_command",
                 "write_stdin",
-                "list_mcp_resources",
-                "list_mcp_resource_templates",
-                "read_mcp_resource",
                 "update_plan",
                 "request_user_input",
+                "apply_patch",
                 "web_search",
                 "view_image",
             ],
@@ -2257,16 +2276,15 @@ mod tests {
     #[test]
     fn test_build_specs_default_shell_present() {
         let config = test_config();
-        let model_info = ModelsManager::construct_model_info_offline("o3", &config);
+        let model_info = ModelsManager::construct_model_info_offline_for_tests("o3", &config);
         let mut features = Features::with_defaults();
         features.enable(Feature::UnifiedExec);
         let tools_config = ToolsConfig::new(&ToolsConfigParams {
             model_info: &model_info,
             features: &features,
             web_search_mode: Some(WebSearchMode::Live),
-            vector_db: config.vector_db,
         });
-        let (tools, _) = build_specs(&tools_config, Some(HashMap::new()), &[]).build();
+        let (tools, _) = build_specs(&tools_config, Some(HashMap::new()), None, &[]).build();
 
         // Only check the shell variant and a couple of core tools.
         let mut subset = vec!["exec_command", "write_stdin", "update_plan"];
@@ -2277,19 +2295,36 @@ mod tests {
     }
 
     #[test]
+    fn shell_zsh_fork_prefers_shell_command_over_unified_exec() {
+        let config = test_config();
+        let model_info = ModelsManager::construct_model_info_offline_for_tests("o3", &config);
+        let mut features = Features::with_defaults();
+        features.enable(Feature::UnifiedExec);
+        features.enable(Feature::ShellZshFork);
+
+        let tools_config = ToolsConfig::new(&ToolsConfigParams {
+            model_info: &model_info,
+            features: &features,
+            web_search_mode: Some(WebSearchMode::Live),
+        });
+
+        assert_eq!(tools_config.shell_type, ConfigShellToolType::ShellCommand);
+    }
+
+    #[test]
     #[ignore]
     fn test_parallel_support_flags() {
         let config = test_config();
-        let model_info = ModelsManager::construct_model_info_offline("gpt-5-codex", &config);
+        let model_info =
+            ModelsManager::construct_model_info_offline_for_tests("gpt-5-codex", &config);
         let mut features = Features::with_defaults();
         features.enable(Feature::UnifiedExec);
         let tools_config = ToolsConfig::new(&ToolsConfigParams {
             model_info: &model_info,
             features: &features,
             web_search_mode: Some(WebSearchMode::Cached),
-            vector_db: config.vector_db,
         });
-        let (tools, _) = build_specs(&tools_config, None, &[]).build();
+        let (tools, _) = build_specs(&tools_config, None, None, &[]).build();
 
         assert!(find_tool(&tools, "exec_command").supports_parallel_tool_calls);
         assert!(!find_tool(&tools, "write_stdin").supports_parallel_tool_calls);
@@ -2300,16 +2335,20 @@ mod tests {
 
     #[test]
     fn test_test_model_info_includes_sync_tool() {
-        let config = test_config();
-        let model_info = ModelsManager::construct_model_info_offline("test-gpt-5-codex", &config);
+        let mut model_info = model_info_from_models_json("gpt-5-codex");
+        model_info.experimental_supported_tools = vec![
+            "test_sync_tool".to_string(),
+            "read_file".to_string(),
+            "grep_files".to_string(),
+            "list_dir".to_string(),
+        ];
         let features = Features::with_defaults();
         let tools_config = ToolsConfig::new(&ToolsConfigParams {
             model_info: &model_info,
             features: &features,
             web_search_mode: Some(WebSearchMode::Cached),
-            vector_db: config.vector_db,
         });
-        let (tools, _) = build_specs(&tools_config, None, &[]).build();
+        let (tools, _) = build_specs(&tools_config, None, None, &[]).build();
 
         assert!(
             tools
@@ -2332,14 +2371,13 @@ mod tests {
     #[test]
     fn test_build_specs_mcp_tools_converted() {
         let config = test_config();
-        let model_info = ModelsManager::construct_model_info_offline("o3", &config);
+        let model_info = ModelsManager::construct_model_info_offline_for_tests("o3", &config);
         let mut features = Features::with_defaults();
         features.enable(Feature::UnifiedExec);
         let tools_config = ToolsConfig::new(&ToolsConfigParams {
             model_info: &model_info,
             features: &features,
             web_search_mode: Some(WebSearchMode::Live),
-            vector_db: config.vector_db,
         });
         let (tools, _) = build_specs(
             &tools_config,
@@ -2366,6 +2404,7 @@ mod tests {
                     }),
                 ),
             )])),
+            None,
             &[],
         )
         .build();
@@ -2418,14 +2457,13 @@ mod tests {
     #[test]
     fn test_build_specs_mcp_tools_sorted_by_name() {
         let config = test_config();
-        let model_info = ModelsManager::construct_model_info_offline("o3", &config);
+        let model_info = ModelsManager::construct_model_info_offline_for_tests("o3", &config);
         let mut features = Features::with_defaults();
         features.enable(Feature::UnifiedExec);
         let tools_config = ToolsConfig::new(&ToolsConfigParams {
             model_info: &model_info,
             features: &features,
             web_search_mode: Some(WebSearchMode::Cached),
-            vector_db: config.vector_db,
         });
 
         // Intentionally construct a map with keys that would sort alphabetically.
@@ -2444,7 +2482,7 @@ mod tests {
             ),
         ]);
 
-        let (tools, _) = build_specs(&tools_config, Some(tools_map), &[]).build();
+        let (tools, _) = build_specs(&tools_config, Some(tools_map), None, &[]).build();
 
         // Only assert that the MCP tools themselves are sorted by fully-qualified name.
         let mcp_names: Vec<_> = tools
@@ -2461,16 +2499,83 @@ mod tests {
     }
 
     #[test]
+    fn search_tool_description_includes_only_codex_apps_connector_names() {
+        let config = test_config();
+        let model_info =
+            ModelsManager::construct_model_info_offline_for_tests("gpt-5-codex", &config);
+        let mut features = Features::with_defaults();
+        features.enable(Feature::Apps);
+        let tools_config = ToolsConfig::new(&ToolsConfigParams {
+            model_info: &model_info,
+            features: &features,
+            web_search_mode: Some(WebSearchMode::Cached),
+        });
+
+        let (tools, _) = build_specs(
+            &tools_config,
+            Some(HashMap::from([
+                (
+                    "mcp__codex_apps__calendar_create_event".to_string(),
+                    mcp_tool(
+                        "calendar_create_event",
+                        "Create calendar event",
+                        serde_json::json!({"type": "object"}),
+                    ),
+                ),
+                (
+                    "mcp__rmcp__echo".to_string(),
+                    mcp_tool("echo", "Echo", serde_json::json!({"type": "object"})),
+                ),
+            ])),
+            Some(HashMap::from([
+                (
+                    "mcp__codex_apps__calendar_create_event".to_string(),
+                    ToolInfo {
+                        server_name: crate::mcp::CODEX_APPS_MCP_SERVER_NAME.to_string(),
+                        tool_name: "calendar_create_event".to_string(),
+                        tool: mcp_tool(
+                            "calendar_create_event",
+                            "Create calendar event",
+                            serde_json::json!({"type": "object"}),
+                        ),
+                        connector_id: Some("calendar".to_string()),
+                        connector_name: Some("Calendar".to_string()),
+                    },
+                ),
+                (
+                    "mcp__rmcp__echo".to_string(),
+                    ToolInfo {
+                        server_name: "rmcp".to_string(),
+                        tool_name: "echo".to_string(),
+                        tool: mcp_tool("echo", "Echo", serde_json::json!({"type": "object"})),
+                        connector_id: None,
+                        connector_name: None,
+                    },
+                ),
+            ])),
+            &[],
+        )
+        .build();
+
+        let search_tool = find_tool(&tools, SEARCH_TOOL_BM25_TOOL_NAME);
+        let ToolSpec::Function(ResponsesApiTool { description, .. }) = &search_tool.spec else {
+            panic!("expected function tool");
+        };
+        assert!(description.contains("Calendar"));
+        assert!(!description.contains("mcp__rmcp__echo"));
+    }
+
+    #[test]
     fn test_mcp_tool_property_missing_type_defaults_to_string() {
         let config = test_config();
-        let model_info = ModelsManager::construct_model_info_offline("gpt-5-codex", &config);
+        let model_info =
+            ModelsManager::construct_model_info_offline_for_tests("gpt-5-codex", &config);
         let mut features = Features::with_defaults();
         features.enable(Feature::UnifiedExec);
         let tools_config = ToolsConfig::new(&ToolsConfigParams {
             model_info: &model_info,
             features: &features,
             web_search_mode: Some(WebSearchMode::Cached),
-            vector_db: config.vector_db,
         });
 
         let (tools, _) = build_specs(
@@ -2488,6 +2593,7 @@ mod tests {
                     }),
                 ),
             )])),
+            None,
             &[],
         )
         .build();
@@ -2516,14 +2622,14 @@ mod tests {
     #[test]
     fn test_mcp_tool_integer_normalized_to_number() {
         let config = test_config();
-        let model_info = ModelsManager::construct_model_info_offline("gpt-5-codex", &config);
+        let model_info =
+            ModelsManager::construct_model_info_offline_for_tests("gpt-5-codex", &config);
         let mut features = Features::with_defaults();
         features.enable(Feature::UnifiedExec);
         let tools_config = ToolsConfig::new(&ToolsConfigParams {
             model_info: &model_info,
             features: &features,
             web_search_mode: Some(WebSearchMode::Cached),
-            vector_db: config.vector_db,
         });
 
         let (tools, _) = build_specs(
@@ -2539,6 +2645,7 @@ mod tests {
                     }),
                 ),
             )])),
+            None,
             &[],
         )
         .build();
@@ -2565,7 +2672,8 @@ mod tests {
     #[test]
     fn test_mcp_tool_array_without_items_gets_default_string_items() {
         let config = test_config();
-        let model_info = ModelsManager::construct_model_info_offline("gpt-5-codex", &config);
+        let model_info =
+            ModelsManager::construct_model_info_offline_for_tests("gpt-5-codex", &config);
         let mut features = Features::with_defaults();
         features.enable(Feature::UnifiedExec);
         features.enable(Feature::ApplyPatchFreeform);
@@ -2573,7 +2681,6 @@ mod tests {
             model_info: &model_info,
             features: &features,
             web_search_mode: Some(WebSearchMode::Cached),
-            vector_db: config.vector_db,
         });
 
         let (tools, _) = build_specs(
@@ -2589,6 +2696,7 @@ mod tests {
                     }),
                 ),
             )])),
+            None,
             &[],
         )
         .build();
@@ -2618,14 +2726,14 @@ mod tests {
     #[test]
     fn test_mcp_tool_anyof_defaults_to_string() {
         let config = test_config();
-        let model_info = ModelsManager::construct_model_info_offline("gpt-5-codex", &config);
+        let model_info =
+            ModelsManager::construct_model_info_offline_for_tests("gpt-5-codex", &config);
         let mut features = Features::with_defaults();
         features.enable(Feature::UnifiedExec);
         let tools_config = ToolsConfig::new(&ToolsConfigParams {
             model_info: &model_info,
             features: &features,
             web_search_mode: Some(WebSearchMode::Cached),
-            vector_db: config.vector_db,
         });
 
         let (tools, _) = build_specs(
@@ -2643,6 +2751,7 @@ mod tests {
                     }),
                 ),
             )])),
+            None,
             &[],
         )
         .build();
@@ -2668,7 +2777,7 @@ mod tests {
 
     #[test]
     fn test_shell_tool() {
-        let tool = super::create_shell_tool(true);
+        let tool = super::create_shell_tool();
         let ToolSpec::Function(ResponsesApiTool {
             description, name, ..
         }) = &tool
@@ -2679,7 +2788,7 @@ mod tests {
 
         let expected = if cfg!(windows) {
             r#"Runs a Powershell command (Windows) and returns its output. Arguments to `shell` will be passed to CreateProcessW(). Most commands should be prefixed with ["powershell.exe", "-Command"].
-        
+
 Examples of valid command strings:
 
 - ls -a (show hidden): ["powershell.exe", "-Command", "Get-ChildItem -Force"]
@@ -2709,7 +2818,7 @@ Examples of valid command strings:
 
         let expected = if cfg!(windows) {
             r#"Runs a Powershell command (Windows) and returns its output.
-        
+
 Examples of valid command strings:
 
 - ls -a (show hidden): "Get-ChildItem -Force"
@@ -2728,14 +2837,14 @@ Examples of valid command strings:
     #[test]
     fn test_get_openai_tools_mcp_tools_with_additional_properties_schema() {
         let config = test_config();
-        let model_info = ModelsManager::construct_model_info_offline("gpt-5-codex", &config);
+        let model_info =
+            ModelsManager::construct_model_info_offline_for_tests("gpt-5-codex", &config);
         let mut features = Features::with_defaults();
         features.enable(Feature::UnifiedExec);
         let tools_config = ToolsConfig::new(&ToolsConfigParams {
             model_info: &model_info,
             features: &features,
             web_search_mode: Some(WebSearchMode::Cached),
-            vector_db: config.vector_db,
         });
         let (tools, _) = build_specs(
             &tools_config,
@@ -2769,6 +2878,7 @@ Examples of valid command strings:
                     }),
                 ),
             )])),
+            None,
             &[],
         )
         .build();
