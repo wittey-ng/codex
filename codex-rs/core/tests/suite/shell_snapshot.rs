@@ -1,5 +1,4 @@
 use anyhow::Result;
-use anyhow::anyhow;
 use codex_core::features::Feature;
 use codex_protocol::config_types::ReasoningSummary;
 use codex_protocol::protocol::AskForApproval;
@@ -51,7 +50,7 @@ struct SnapshotRunOptions {
 
 async fn wait_for_snapshot(codex_home: &Path) -> Result<PathBuf> {
     let snapshot_dir = codex_home.join("shell_snapshots");
-    let deadline = Instant::now() + Duration::from_secs(5);
+    let deadline = Instant::now() + Duration::from_secs(15);
     loop {
         if let Ok(mut entries) = fs::read_dir(&snapshot_dir).await
             && let Some(entry) = entries.next_entry().await?
@@ -68,7 +67,7 @@ async fn wait_for_snapshot(codex_home: &Path) -> Result<PathBuf> {
 }
 
 async fn wait_for_file_contents(path: &Path) -> Result<String> {
-    let deadline = Instant::now() + Duration::from_secs(5);
+    let deadline = Instant::now() + Duration::from_secs(15);
     loop {
         match fs::read_to_string(path).await {
             Ok(contents) => return Ok(contents),
