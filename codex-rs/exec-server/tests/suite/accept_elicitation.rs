@@ -250,7 +250,8 @@ async fn call_shell_with_retry(
 
     for attempt in 1..=MAX_ATTEMPTS {
         let result = service
-            .call_tool(CallToolRequestParam {
+            .call_tool(CallToolRequestParams {
+                meta: None,
                 name: Cow::Borrowed("shell"),
                 arguments: Some(object(json!(
                     {
@@ -259,6 +260,7 @@ async fn call_shell_with_retry(
                         "workdir": project_root_path.to_string_lossy(),
                     }
                 ))),
+                task: None,
             })
             .await;
         match result {

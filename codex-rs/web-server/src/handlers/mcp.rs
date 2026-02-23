@@ -251,6 +251,7 @@ pub async fn mcp_oauth_login(
         &[],  // scopes - default to empty for now (could be extended via request body)
         None, // timeout_secs - use default
         config.mcp_oauth_callback_port,
+        config.mcp_oauth_callback_url.as_deref(),
     )
     .await
     .map_err(|e| ApiError::InternalError(format!("Failed to initiate OAuth login: {e}")))?;

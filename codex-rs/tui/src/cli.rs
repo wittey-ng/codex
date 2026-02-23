@@ -67,10 +67,6 @@ pub struct Cli {
     #[arg(long = "profile", short = 'p')]
     pub config_profile: Option<String>,
 
-    /// Agent role to use for this session (default, orchestrator, research, worker).
-    #[arg(long = "role", short = 'r', value_enum)]
-    pub agent_role: Option<codex_core::AgentRole>,
-
     /// Select the sandbox policy to use when executing model-generated shell
     /// commands.
     #[arg(long = "sandbox", short = 's')]

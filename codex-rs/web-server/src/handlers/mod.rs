@@ -260,7 +260,8 @@ pub async fn stream_events(
                         EventMsg::ExecApprovalRequest(ev) => {
                             // Register approval context
                             let (tx, rx) = oneshot::channel();
-                            let approval_id = ev.call_id.clone();
+                            let call_id = ev.call_id.clone();
+                            let approval_id = ev.effective_approval_id();
                             let approval_ctx = ApprovalContext {
                                 thread_id,
                                 item_id: approval_id.clone(),
@@ -283,8 +284,13 @@ pub async fn stream_events(
                             let params = CommandExecutionRequestApprovalParams {
                                 thread_id: thread_id.to_string(),
                                 turn_id: ev.turn_id.clone(),
-                                item_id: approval_id.clone(),
+                                item_id: call_id,
+                                approval_id: ev.approval_id.clone(),
                                 reason: ev.reason.clone(),
+                                network_approval_context: ev
+                                    .network_approval_context
+                                    .clone()
+                                    .map(std::convert::Into::into),
                                 command: Some(ev.command.join(" ")),
                                 cwd: Some(ev.cwd.clone()),
                                 command_actions: None,
@@ -297,6 +303,7 @@ pub async fn stream_events(
 
                             // Spawn task to wait for approval response
                             let thread_clone = thread_for_approval.clone();
+                            let approval_id_clone = approval_id.clone();
                             let turn_id_clone = ev.turn_id.clone();
                             tokio::spawn(async move {
                                 match rx.await {
@@ -312,7 +319,8 @@ pub async fn stream_events(
 
                                         if let Err(e) = thread_clone
                                             .submit(Op::ExecApproval {
-                                                id: turn_id_clone,
+                                                id: approval_id_clone.clone(),
+                                                turn_id: Some(turn_id_clone.clone()),
                                                 decision,
                                             })
                                             .await
@@ -324,7 +332,8 @@ pub async fn stream_events(
                                         // Channel closed, submit denial
                                         if let Err(e) = thread_clone
                                             .submit(Op::ExecApproval {
-                                                id: turn_id_clone,
+                                                id: approval_id_clone.clone(),
+                                                turn_id: Some(turn_id_clone.clone()),
                                                 decision: ReviewDecision::Denied,
                                             })
                                             .await
@@ -371,7 +380,7 @@ pub async fn stream_events(
 
                             // Spawn task to wait for approval response
                             let thread_clone = thread_for_approval.clone();
-                            let turn_id_clone = ev.turn_id.clone();
+                            let approval_id_clone = approval_id.clone();
                             tokio::spawn(async move {
                                 match rx.await {
                                     Ok(response) => {
@@ -386,7 +395,7 @@ pub async fn stream_events(
 
                                         if let Err(e) = thread_clone
                                             .submit(Op::PatchApproval {
-                                                id: turn_id_clone,
+                                                id: approval_id_clone.clone(),
                                                 decision,
                                             })
                                             .await
@@ -398,7 +407,7 @@ pub async fn stream_events(
                                         // Channel closed, submit denial
                                         if let Err(e) = thread_clone
                                             .submit(Op::PatchApproval {
-                                                id: turn_id_clone,
+                                                id: approval_id_clone.clone(),
                                                 decision: ReviewDecision::Denied,
                                             })
                                             .await

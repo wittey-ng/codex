@@ -296,7 +296,7 @@ pub async fn fork_thread(
         })?;
         state
             .thread_manager
-            .fork_thread(usize::MAX, config, rollout_path)
+            .fork_thread(usize::MAX, config, rollout_path, false)
             .await
             .map_err(|e| ApiError::InternalError(format!("Failed to fork thread: {e}")))?
     };

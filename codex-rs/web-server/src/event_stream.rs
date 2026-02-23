@@ -729,6 +729,9 @@ impl EventStreamProcessor {
         match notification {
             ServerNotification::Error(_) => "error",
             ServerNotification::ThreadStarted(_) => "thread/started",
+            ServerNotification::ThreadStatusChanged(_) => "thread/status/changed",
+            ServerNotification::ThreadArchived(_) => "thread/archived",
+            ServerNotification::ThreadUnarchived(_) => "thread/unarchived",
             ServerNotification::ThreadTokenUsageUpdated(_) => "thread/tokenUsage/updated",
             ServerNotification::TurnStarted(_) => "turn/started",
             ServerNotification::TurnCompleted(_) => "turn/completed",
@@ -749,13 +752,22 @@ impl EventStreamProcessor {
             ServerNotification::McpServerOauthLoginCompleted(_) => "mcpServer/oauthLogin/completed",
             ServerNotification::AccountUpdated(_) => "account/updated",
             ServerNotification::AccountRateLimitsUpdated(_) => "account/rateLimits/updated",
+            ServerNotification::AppListUpdated(_) => "app/list/updated",
             ServerNotification::ReasoningSummaryTextDelta(_) => "item/reasoning/summaryTextDelta",
             ServerNotification::ReasoningSummaryPartAdded(_) => "item/reasoning/summaryPartAdded",
             ServerNotification::ReasoningTextDelta(_) => "item/reasoning/textDelta",
             ServerNotification::ContextCompacted(_) => "thread/compacted",
+            ServerNotification::ModelRerouted(_) => "model/rerouted",
             ServerNotification::DeprecationNotice(_) => "deprecationNotice",
             ServerNotification::ConfigWarning(_) => "configWarning",
+            ServerNotification::FuzzyFileSearchSessionUpdated(_) => {
+                "fuzzyFileSearch/sessionUpdated"
+            }
+            ServerNotification::FuzzyFileSearchSessionCompleted(_) => {
+                "fuzzyFileSearch/sessionCompleted"
+            }
             ServerNotification::WindowsWorldWritableWarning(_) => "windows/worldWritableWarning",
+            ServerNotification::WindowsSandboxSetupCompleted(_) => "windowsSandbox/setupCompleted",
             ServerNotification::AccountLoginCompleted(_) => "account/login/completed",
             ServerNotification::AuthStatusChange(_) => "authStatusChange",
             ServerNotification::LoginChatGptComplete(_) => "loginChatGptComplete",

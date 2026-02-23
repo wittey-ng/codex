@@ -8,10 +8,11 @@ use codex_core::exec::ExecParams;
 use codex_core::exec::SandboxType;
 use codex_core::exec::process_exec_tool_call;
 use codex_core::exec_env::create_env;
+use codex_core::features::Feature;
 use codex_core::get_platform_sandbox;
-use codex_core::protocol::SandboxPolicy;
 use codex_core::sandboxing::SandboxPermissions;
 use codex_protocol::config_types::WindowsSandboxLevel;
+use codex_protocol::protocol::SandboxPolicy;
 use serde::Deserialize;
 use serde::Serialize;
 use std::collections::HashMap;
@@ -91,7 +92,7 @@ pub async fn execute_command(
         .await
         .map_err(|e| ApiError::InternalError(format!("Failed to load config: {e}")))?;
 
-    let sandbox_policy = config.sandbox_policy.get();
+    let sandbox_policy = config.permissions.sandbox_policy.get();
     if matches!(
         sandbox_policy,
         SandboxPolicy::DangerFullAccess | SandboxPolicy::ExternalSandbox { .. }
@@ -108,30 +109,40 @@ pub async fn execute_command(
         ));
     }
 
-    let env: HashMap<String, String> = create_env(&config.shell_environment_policy);
+    let env: HashMap<String, String> =
+        create_env(&config.permissions.shell_environment_policy, None);
 
     let params = ExecParams {
         command: req.command,
         cwd: cwd.clone(),
         expiration: ExecExpiration::Timeout(std::time::Duration::from_secs(10)),
         env,
+        network: None,
         sandbox_permissions: SandboxPermissions::UseDefault,
         windows_sandbox_level: WindowsSandboxLevel::Disabled,
         justification: None,
         arg0: None,
     };
 
-    let output = process_exec_tool_call(params, sandbox_policy, &cwd, &None, None)
-        .await
-        .map_err(|err| match err {
-            CodexErr::Sandbox(SandboxErr::Timeout { .. }) => {
-                ApiError::Timeout("Command exceeded 10s timeout".to_string())
-            }
-            CodexErr::InvalidRequest(message) | CodexErr::UnsupportedOperation(message) => {
-                ApiError::InvalidRequest(message)
-            }
-            other => ApiError::InternalError(other.to_string()),
-        })?;
+    let use_linux_sandbox_bwrap = config.features.enabled(Feature::UseLinuxSandboxBwrap);
+    let output = process_exec_tool_call(
+        params,
+        sandbox_policy,
+        &cwd,
+        &config.codex_linux_sandbox_exe,
+        use_linux_sandbox_bwrap,
+        None,
+    )
+    .await
+    .map_err(|err| match err {
+        CodexErr::Sandbox(SandboxErr::Timeout { .. }) => {
+            ApiError::Timeout("Command exceeded 10s timeout".to_string())
+        }
+        CodexErr::InvalidRequest(message) | CodexErr::UnsupportedOperation(message) => {
+            ApiError::InvalidRequest(message)
+        }
+        other => ApiError::InternalError(other.to_string()),
+    })?;
 
     let stdout = output.stdout.text;
     let stderr = output.stderr.text;

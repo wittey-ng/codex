@@ -14,8 +14,9 @@ use codex_core::exec::ExecToolCallOutput;
 use codex_core::exec::SandboxType;
 use codex_core::exec::process_exec_tool_call;
 use codex_core::get_platform_sandbox;
-use codex_core::protocol::SandboxPolicy;
 use codex_core::sandboxing::SandboxPermissions;
+use codex_protocol::config_types::WindowsSandboxLevel;
+use codex_protocol::protocol::SandboxPolicy;
 use pretty_assertions::assert_eq;
 use serial_test::serial;
 
@@ -53,7 +54,7 @@ fn ensure_boxlite_enabled() -> bool {
         return false;
     }
 
-    match get_platform_sandbox() {
+    match get_platform_sandbox(false) {
         Some(SandboxType::BoxLite) => true,
         other => {
             eprintln!("Skipping BoxLite integration tests; sandbox is {other:?}.");
@@ -76,13 +77,15 @@ async fn run_boxlite(
         cwd: PathBuf::from(cwd),
         expiration,
         env: HashMap::new(),
+        network: None,
         sandbox_permissions: SandboxPermissions::UseDefault,
+        windows_sandbox_level: WindowsSandboxLevel::Disabled,
         justification: None,
         arg0: None,
     };
 
     let policy = SandboxPolicy::new_read_only_policy();
-    process_exec_tool_call(params, &policy, Path::new(cwd), &None, None).await
+    process_exec_tool_call(params, &policy, Path::new(cwd), &None, false, None).await
 }
 
 #[tokio::test]

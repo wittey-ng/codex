@@ -2,7 +2,6 @@ use axum::Json;
 use axum::extract::State;
 use codex_app_server_protocol::Model;
 use codex_app_server_protocol::ReasoningEffortOption;
-use codex_core::config::Config;
 use codex_core::models_manager::manager::RefreshStrategy;
 use codex_protocol::openai_models::ModelPreset;
 use codex_protocol::openai_models::ReasoningEffortPreset;
@@ -68,20 +67,10 @@ pub async fn list_models(
         provider: None,
     };
 
-    // Load config
-    let mut config = Config::load_with_cli_overrides(vec![])
-        .await
-        .map_err(|e| ApiError::InternalError(format!("Failed to load config: {e}")))?;
-
-    // Enable remote models feature
-    config
-        .features
-        .enable(codex_core::features::Feature::RemoteModels);
-
     // List all models
     let all_models = state
         .thread_manager
-        .list_models(&config, RefreshStrategy::OnlineIfUncached)
+        .list_models(RefreshStrategy::OnlineIfUncached)
         .await
         .into_iter()
         .filter(|preset| preset.show_in_picker)
@@ -122,17 +111,33 @@ pub async fn list_models(
 }
 
 fn model_from_preset(preset: ModelPreset) -> Model {
+    let ModelPreset {
+        id,
+        model,
+        display_name,
+        description,
+        default_reasoning_effort,
+        supported_reasoning_efforts,
+        supports_personality,
+        is_default,
+        upgrade,
+        show_in_picker,
+        supported_in_api: _,
+        input_modalities,
+    } = preset;
+
     Model {
-        id: preset.id.to_string(),
-        model: preset.model.to_string(),
-        display_name: preset.display_name.to_string(),
-        description: preset.description.to_string(),
-        supported_reasoning_efforts: reasoning_efforts_from_preset(
-            preset.supported_reasoning_efforts,
-        ),
-        default_reasoning_effort: preset.default_reasoning_effort,
-        supports_personality: preset.supports_personality,
-        is_default: preset.is_default,
+        id,
+        model,
+        upgrade: upgrade.map(|upgrade| upgrade.id),
+        display_name,
+        description,
+        hidden: !show_in_picker,
+        supported_reasoning_efforts: reasoning_efforts_from_preset(supported_reasoning_efforts),
+        default_reasoning_effort,
+        input_modalities,
+        supports_personality,
+        is_default,
     }
 }
 

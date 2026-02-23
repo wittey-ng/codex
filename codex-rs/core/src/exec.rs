@@ -145,6 +145,8 @@ impl SandboxType {
             SandboxType::MacosSeatbelt => "seatbelt",
             SandboxType::LinuxSeccomp => "seccomp",
             SandboxType::WindowsRestrictedToken => "windows_sandbox",
+            #[cfg(feature = "sandbox-tool")]
+            SandboxType::BoxLite => "boxlite",
         }
     }
 }
@@ -978,7 +980,7 @@ async fn exec_boxlite(
     };
 
     // Always mount the session cwd so tools can operate on the workspace.
-    let cwd_read_only = matches!(sandbox_policy, SandboxPolicy::ReadOnly);
+    let cwd_read_only = matches!(sandbox_policy, SandboxPolicy::ReadOnly { .. });
     mount(&cwd, cwd_read_only);
 
     // If the command refers to an absolute host binary, make it available in

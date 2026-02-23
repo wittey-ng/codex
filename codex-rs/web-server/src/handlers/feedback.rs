@@ -85,11 +85,12 @@ pub async fn upload_feedback(
 
     let upload_result = tokio::task::spawn_blocking(move || {
         let snapshot = feedback.snapshot(None);
+        let extra_log_files = rollout_path.into_iter().collect::<Vec<_>>();
         snapshot.upload_feedback(
             &classification,
             reason.as_deref(),
             include_logs,
-            rollout_path.as_deref(),
+            &extra_log_files,
             Some(session_source),
         )
     })
